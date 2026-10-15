@@ -1,0 +1,16 @@
+dataset:
+  name: HuggingFaceH4/ultrachat_200k
+  revision: main
+  train_split: train_sft
+  eval_split: test_sft
+  seed: 42
+  train_samples: null
+  eval_samples: 128
+  max_length: 1024
+  chat_template: olmo2
+  train_data_path: data/ultrachat/train_sft.jsonl
+  eval_data_path: data/ultrachat/test_sft.jsonl
+  train_features_path: data/features/train
+  eval_features_path: data/features/eval
+  cache_dir: .cache
+  preprocessing_batch_size: 1

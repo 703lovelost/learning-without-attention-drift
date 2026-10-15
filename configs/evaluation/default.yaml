@@ -1,0 +1,6 @@
+evaluation:
+  # Native SpecForge offline evaluation consumes separately captured features.
+  eval_interval: 100
+  max_eval_samples: 128
+  inference_max_new_tokens: 24
+  inference_port: 30000

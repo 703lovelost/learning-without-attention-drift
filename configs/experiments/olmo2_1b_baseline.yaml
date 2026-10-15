@@ -1,0 +1,12 @@
+experiment:
+  name: olmo2-1b-eagle3-baseline
+  model: ../models/olmo2_1b.yaml
+  dataset: ../datasets/ultrachat_200k.yaml
+  training: ../training/eagle3_single_gpu.yaml
+  evaluation: ../evaluation/default.yaml
+infrastructure:
+  device: cuda:0
+  output_dir: outputs/olmo2_1b_eagle3
+  resume_from_checkpoint: null
+  mlflow_tracking_uri: ${MLFLOW_TRACKING_URI}
+  mlflow_experiment_name: ${MLFLOW_EXPERIMENT_NAME:-eagle3-olmo2}

@@ -1,0 +1,22 @@
+model:
+  target_model_path: allenai/OLMo-2-0425-1B-Instruct
+  revision: main
+  tokenizer_path: allenai/OLMo-2-0425-1B-Instruct
+  tokenizer_revision: main
+  draft_architecture: LlamaForCausalLMEagle3
+  draft_model_config: olmo2_1b_eagle3.json
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  # SGLang owns frozen-target feature capture. This must be verified against
+  # the pinned SpecForge/SGLang runtime before a GPU run is considered valid.
+  target_backend: sglang
+  # SpecForge pins SGLang 0.5.18, which rejects FlashInfer for Olmo2 targets.
+  capture_attention_backend: triton
+  sglang_mem_fraction_static: 0.35
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  draft_num_hidden_layers: 1
+  draft_vocab_size: 32000
+  # Zero-based target block indices; OLMo-2 1B has 16 transformer blocks.
+  aux_hidden_state_layer_ids: [1, 7, 12]
+  max_position_embeddings: 4096

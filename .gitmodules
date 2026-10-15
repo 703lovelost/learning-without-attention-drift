@@ -1,0 +1,3 @@
+[submodule "specforge"]
+	path = specforge
+	url = https://github.com/703lovelost/SpecForge.git
