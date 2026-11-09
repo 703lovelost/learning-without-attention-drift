@@ -6,7 +6,7 @@ experiment:
   evaluation: ../evaluation/default.yaml
 infrastructure:
   device: cuda:0
-  output_dir: outputs/olmo2_1b_eagle3
+  output_dir: ${oc.env:EAGLE3_OUTPUT_DIR,outputs/olmo2_1b_eagle3}
   resume_from_checkpoint: null
   mlflow_tracking_uri: ${MLFLOW_TRACKING_URI}
   mlflow_experiment_name: ${MLFLOW_EXPERIMENT_NAME:-eagle3-olmo2}

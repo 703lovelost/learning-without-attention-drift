@@ -1,0 +1,24 @@
+# @package _global_
+
+defaults:
+  - /models@_global_: olmo2_1b
+  - /datasets@_global_: ultrachat_200k
+  - /training@_global_: eagle3_single_gpu
+  - /evaluation@_global_: default
+  - _self_
+
+experiment:
+  name: olmo2-1b-eagle3-baseline
+
+infrastructure:
+  device: cuda:0
+  output_dir: ${oc.env:EAGLE3_OUTPUT_DIR,outputs/olmo2_1b_eagle3}
+  resume_from_checkpoint: null
+  mlflow_tracking_uri: null
+  mlflow_experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,eagle3-olmo2}
+
+cli:
+  limit: null
+  split: all
+  cuda_visible_devices: null
+  output_config: null

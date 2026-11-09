@@ -49,18 +49,31 @@ def main() -> None:
         add_generation_prompt=True,
     )
     command = [
-        sys.executable, "-m", "sglang.launch_server",
-        "--model-path", args.target_model,
-        "--speculative-algorithm", "EAGLE3",
-        "--speculative-draft-model-path", args.draft_model,
-        "--speculative-num-steps", "3",
-        "--speculative-eagle-topk", "1",
-        "--speculative-num-draft-tokens", "4",
-        "--host", "127.0.0.1",
-        "--port", str(args.port),
-        "--mem-fraction-static", "0.55",
-        "--max-running-requests", "1",
-        "--attention-backend", "triton",
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        args.target_model,
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        args.draft_model,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--mem-fraction-static",
+        "0.55",
+        "--max-running-requests",
+        "1",
+        "--attention-backend",
+        "triton",
         "--disable-cuda-graph",
     ]
     source_root = str(Path(__file__).resolve().parents[1])
@@ -78,6 +91,7 @@ def main() -> None:
         env=env,
     )
     logs: deque[str] = deque(maxlen=100)
+
     def drain_logs() -> None:
         if server.stdout is not None:
             for line in server.stdout:
@@ -100,10 +114,18 @@ def main() -> None:
             except (URLError, TimeoutError, OSError):
                 time.sleep(2)
         if not ready:
-            raise RuntimeError("SGLang target/drafter server did not become ready: " + "".join(logs))
+            raise RuntimeError(
+                "SGLang target/drafter server did not become ready: " + "".join(logs)
+            )
         result = _post(
             f"http://127.0.0.1:{args.port}/generate",
-            {"text": prompt, "sampling_params": {"temperature": 0, "max_new_tokens": args.max_new_tokens}},
+            {
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": args.max_new_tokens,
+                },
+            },
         )
         output = {
             "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -111,10 +133,14 @@ def main() -> None:
             "draft_model": args.draft_model,
             "prompt": prompt,
             "response": result,
-            "spec_accept_length": (result.get("meta_info") or {}).get("spec_accept_length"),
+            "spec_accept_length": (result.get("meta_info") or {}).get(
+                "spec_accept_length"
+            ),
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        args.output.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         print(f"Inference smoke passed; saved response to {args.output}")
     finally:
         server.terminate()

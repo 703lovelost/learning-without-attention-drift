@@ -8,9 +8,9 @@ dataset:
   eval_samples: 128
   max_length: 1024
   chat_template: olmo2
-  train_data_path: data/ultrachat/train_sft.jsonl
-  eval_data_path: data/ultrachat/test_sft.jsonl
-  train_features_path: data/features/train
-  eval_features_path: data/features/eval
-  cache_dir: .cache
+  train_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/train_sft.jsonl
+  eval_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/test_sft.jsonl
+  train_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/features/train
+  eval_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/features/eval
+  cache_dir: ${oc.env:EAGLE3_CACHE_DIR,.cache}
   preprocessing_batch_size: 1

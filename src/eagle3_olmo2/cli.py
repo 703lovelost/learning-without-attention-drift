@@ -11,7 +11,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 
 import yaml
@@ -19,15 +18,18 @@ import yaml
 from eagle3_olmo2.config import (
     DEFAULT_EXPERIMENT,
     ROOT,
+    _expand_env,
     compose,
     experiment_module_path,
     validate_specforge,
 )
+from eagle3_olmo2.dvc import ensure_dvc_artifacts_available
+from eagle3_olmo2.paths import ensure_configured_storage_dirs, expand_env, resolve_path
 
 
 def read_dataset_config(path: Path) -> dict:
     with path.open(encoding="utf-8") as stream:
-        return yaml.safe_load(stream)["dataset"]
+        return expand_env(yaml.safe_load(stream)["dataset"])
 
 
 def _count_jsonl_rows(path: Path) -> int:
@@ -38,9 +40,12 @@ def _count_jsonl_rows(path: Path) -> int:
 
 def experiment_output_dir(experiment_path: Path) -> Path:
     with experiment_path.open(encoding="utf-8") as stream:
-        infrastructure = yaml.safe_load(stream).get("infrastructure", {})
-    output_dir = Path(infrastructure.get("output_dir", "outputs/olmo2_1b_eagle3"))
-    return output_dir if output_dir.is_absolute() else ROOT / output_dir
+        infrastructure = expand_env(yaml.safe_load(stream).get("infrastructure", {}))
+    output_dir = infrastructure.get(
+        "output_dir",
+        os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3"),
+    )
+    return resolve_path(output_dir)
 
 
 def align_final_evaluation(config: dict[str, object]) -> None:
@@ -53,8 +58,10 @@ def align_final_evaluation(config: dict[str, object]) -> None:
     if not feature_root.exists():
         return
     samples = sum(
-        1 for path in feature_root.rglob("*")
-        if path.is_file() and (path.name.endswith(".ckpt") or path.name.endswith(".ckpt.gz"))
+        1
+        for path in feature_root.rglob("*")
+        if path.is_file()
+        and (path.name.endswith(".ckpt") or path.name.endswith(".ckpt.gz"))
     )
     update_quantum = training["batch_size"] * training["accumulation_steps"]
     updates_per_epoch = samples // update_quantum
@@ -95,7 +102,10 @@ def _target_head_compatible_snapshot(model_path: str, output_dir: Path) -> str:
     the experiment output directory when that legacy path is needed.
     """
     source = Path(model_path)
-    if list(source.glob("*.index.json")) or not (source / "model.safetensors").is_file():
+    if (
+        list(source.glob("*.index.json"))
+        or not (source / "model.safetensors").is_file()
+    ):
         return model_path
 
     overlay = output_dir / "model-with-index"
@@ -113,7 +123,8 @@ def _target_head_compatible_snapshot(model_path: str, output_dir: Path) -> str:
         json.dumps(
             {"weight_map": weight_map},
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     return str(overlay.resolve())
@@ -143,11 +154,14 @@ def resolve_model_assets(model_config_path: Path, output_dir: Path) -> tuple[str
                 "resolved_model_path": resolved_model,
                 "training_model_path": indexed_model,
                 "tokenizer_id": tokenizer_id,
-                "tokenizer_revision": model.get("tokenizer_revision", model.get("revision", "main")),
+                "tokenizer_revision": model.get(
+                    "tokenizer_revision", model.get("revision", "main")
+                ),
                 "resolved_tokenizer_path": resolved_tokenizer,
             },
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     return indexed_model, resolved_tokenizer
@@ -156,6 +170,14 @@ def resolve_model_assets(model_config_path: Path, output_dir: Path) -> tuple[str
 def _run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def _configure_tracking_environment(infrastructure: dict[str, object]) -> None:
+    """Pass the configured MLflow URI to child processes without serializing it."""
+    expanded = _expand_env(infrastructure)
+    tracking_uri = expanded.get("mlflow_tracking_uri")
+    if tracking_uri and not os.getenv("MLFLOW_TRACKING_URI"):
+        os.environ["MLFLOW_TRACKING_URI"] = str(tracking_uri)
 
 
 def require_cuda() -> None:
@@ -227,19 +249,45 @@ def _write_svg(path: Path, points: list[tuple[int, float]], title: str) -> None:
         '<rect width="100%" height="100%" fill="white"/>'
         f'<text x="{margin}" y="26" font-family="sans-serif" font-size="17">{title}</text>'
         f'<polyline fill="none" stroke="#2563eb" stroke-width="2" points="{polyline}"/>'
-        f'<text x="{margin}" y="{height-10}" font-family="sans-serif" font-size="12">step {min(xs)}</text>'
-        f'<text x="{width-margin-50}" y="{height-10}" font-family="sans-serif" font-size="12">step {max(xs)}</text>'
-        '</svg>\n'
+        f'<text x="{margin}" y="{height-10}" font-family="sans-serif" '
+        f'font-size="12">step {min(xs)}</text>'
+        f'<text x="{width-margin-50}" y="{height-10}" '
+        f'font-family="sans-serif" font-size="12">step {max(xs)}</text>'
+        "</svg>\n"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(svg, encoding="utf-8")
 
 
-def _record_training(command: list[str], config: dict[str, object], output_config: Path) -> None:
+def _plot_name(metric: str) -> str | None:
+    aliases = {
+        "loss": "train_loss",
+        "train/loss": "train_loss",
+        "eval/avg_loss": "validation_loss",
+        "val/loss": "validation_loss",
+        "lr": "learning_rate",
+        "train/lr": "learning_rate",
+        "eval/simulated_acc_len": "acceptance_length",
+    }
+    if "acceptance_rate" in metric:
+        return metric.replace("/", "_")
+    return aliases.get(metric)
+
+
+def _write_metric_plots(
+    series: dict[str, list[tuple[int, float]]], output_dir: Path
+) -> None:
+    for metric, points in series.items():
+        name = _plot_name(metric)
+        if name:
+            _write_svg(output_dir / f"{name}.svg", points, metric)
+
+
+def _record_training(
+    command: list[str], config: dict[str, object], output_config: Path
+) -> None:
     """Stream native logs, save scalar history/charts, and sample GPU memory."""
-    output_dir = Path(str(config["output_dir"]))
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
+    output_dir = resolve_path(str(config["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
     _reconcile_best_for_resume(config, output_dir)
     log_path = output_dir / "metrics.jsonl"
@@ -267,7 +315,8 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
         )
         if preflight.returncode == 0 and preflight.stdout.strip():
             free_mib, total_mib = [
-                int(value.strip()) for value in preflight.stdout.splitlines()[0].split(",")
+                int(value.strip())
+                for value in preflight.stdout.splitlines()[0].split(",")
             ]
             memory_result.update(
                 status="sampling",
@@ -275,7 +324,8 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
                 total_gpu_mib=total_mib,
             )
             print(
-                f"Detected {free_mib} MiB free of {total_mib} MiB on visible GPU {gpu_id}; "
+                f"Detected {free_mib} MiB free of {total_mib} MiB "
+                f"on visible GPU {gpu_id}; "
                 "training starts with microbatch 1 and CPU optimizer-state offload.",
                 flush=True,
             )
@@ -292,11 +342,22 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
         try:
             while not stop_sampler.is_set():
                 query = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", f"--id={gpu_id}"],
-                    capture_output=True, text=True, timeout=3,
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                        f"--id={gpu_id}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
                 if query.returncode == 0 and query.stdout.strip():
-                    values = [int(line.strip()) for line in query.stdout.splitlines() if line.strip().isdigit()]
+                    values = [
+                        int(line.strip())
+                        for line in query.stdout.splitlines()
+                        if line.strip().isdigit()
+                    ]
                     if values:
                         memory_result["status"] = "sampled"
                         memory_result["peak_used_mib"] = max(
@@ -316,9 +377,20 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
 
     sampler = threading.Thread(target=sample_memory, daemon=True)
     sampler.start()
+    process_env = os.environ.copy()
+    tracker_bootstrap = str(Path(__file__).resolve().parent / "mlflow_bootstrap")
+    existing_python_path = process_env.get("PYTHONPATH")
+    process_env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (tracker_bootstrap, existing_python_path) if path
+    )
     process = subprocess.Popen(
-        command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, env=os.environ.copy(),
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=process_env,
     )
     series: dict[str, list[tuple[int, float]]] = {}
     with log_path.open("w", encoding="utf-8") as metrics_file:
@@ -353,23 +425,7 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
                 eval_interval = config["training"]["eval_interval"]
                 if eval_interval > 0 and step % eval_interval == 0:
                     current_phase[0] = "eval"
-            for metric, points in series.items():
-                aliases = {
-                    "loss": "train_loss",
-                    "train/loss": "train_loss",
-                    "lr": "learning_rate",
-                    "train/lr": "learning_rate",
-                    "eval/simulated_acc_len": "acceptance_length",
-                }
-                plot_name = aliases.get(metric)
-                if "acceptance_rate" in metric:
-                    plot_name = metric.replace("/", "_")
-                if plot_name:
-                    _write_svg(
-                        output_dir / "plots" / f"{plot_name}.svg",
-                        points,
-                        metric,
-                    )
+            _write_metric_plots(series, output_dir / "plots")
     return_code = process.wait()
     stop_sampler.set()
     sampler.join(timeout=2)
@@ -378,23 +434,34 @@ def _record_training(command: list[str], config: dict[str, object], output_confi
     )
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
-    if (os.getenv("MLFLOW_TRACKING_URI") or config.get("tracking", {}).get("mlflow_tracking_uri")):
+    if os.getenv("MLFLOW_TRACKING_URI") or config.get("tracking", {}).get(
+        "mlflow_tracking_uri"
+    ):
         _log_mlflow_artifacts(config, output_dir, output_config)
 
 
-def _log_mlflow_artifacts(config: dict[str, object], output_dir: Path, output_config: Path) -> None:
+def _log_mlflow_artifacts(
+    config: dict[str, object], output_dir: Path, output_config: Path
+) -> None:
     """Attach resolved configuration, scalar history, and SVG plots to MLflow."""
     try:
         from mlflow import MlflowClient
     except ImportError:
-        print("MLflow artifact upload skipped: install mlflow to enable it.", file=sys.stderr)
+        print(
+            "MLflow artifact upload skipped: install mlflow to enable it.",
+            file=sys.stderr,
+        )
         return
-    uri = config["tracking"].get("mlflow_tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+    uri = config["tracking"].get("mlflow_tracking_uri") or os.getenv(
+        "MLFLOW_TRACKING_URI"
+    )
     if uri:
         client = MlflowClient(tracking_uri=uri)
     else:
         client = MlflowClient()
-    experiment = client.get_experiment_by_name(config["tracking"].get("mlflow_experiment_name") or "eagle3-olmo2")
+    experiment = client.get_experiment_by_name(
+        config["tracking"].get("mlflow_experiment_name") or "eagle3-olmo2"
+    )
     if experiment is None:
         return
     run_name = config.get("run_id", "olmo2-eagle3")
@@ -407,6 +474,17 @@ def _log_mlflow_artifacts(config: dict[str, object], output_dir: Path, output_co
     if not runs:
         return
     run_id = runs[0].info.run_id
+    try:
+        commit_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Unable to determine the Git revision for MLflow") from exc
+    client.log_param(run_id, "project.git_commit", commit_sha)
     client.log_artifact(run_id, str(output_config), artifact_path="configuration")
     final_step = 0
     for artifact in (
@@ -441,9 +519,7 @@ def _log_mlflow_artifacts(config: dict[str, object], output_dir: Path, output_co
         ("train", config["data"]["hidden_states_path"]),
         ("eval", config["data"]["eval_hidden_states_path"]),
     ):
-        feature_root = Path(feature_path)
-        if not feature_root.is_absolute():
-            feature_root = ROOT / feature_root
+        feature_root = resolve_path(feature_path)
         memory_record = feature_root / "feature-extraction-memory.json"
         if memory_record.exists():
             client.log_artifact(run_id, str(memory_record), artifact_path="metrics")
@@ -457,7 +533,6 @@ def _log_mlflow_artifacts(config: dict[str, object], output_dir: Path, output_co
             ):
                 value = capture_memory.get(field)
                 if isinstance(value, (int, float)):
-                    split = "train" if "train" in str(feature_path) else "eval"
                     client.log_metric(
                         run_id,
                         f"gpu/capture_{feature_split}_peak_{metric}_mib",
@@ -481,15 +556,24 @@ def _log_mlflow_artifacts(config: dict[str, object], output_dir: Path, output_co
 
 
 def _feature_command(
-    split: str, config_path: Path, model_config_path: Path,
-    model_path: str, tokenizer_path: str, draft_config_path: Path,
-    evaluation_config_path: Path, sample_limit: int | None = None,
+    split: str,
+    config_path: Path,
+    model_config_path: Path,
+    model_path: str,
+    tokenizer_path: str,
+    draft_config_path: Path,
+    evaluation_config_path: Path,
+    sample_limit: int | None = None,
 ) -> list[str]:
     dataset = read_dataset_config(config_path)
-    model_cfg = yaml.safe_load(model_config_path.read_text(encoding="utf-8"))["model"]
+    model_cfg = expand_env(
+        yaml.safe_load(model_config_path.read_text(encoding="utf-8"))["model"]
+    )
     is_train = split == "train"
-    source = ROOT / dataset["train_data_path" if is_train else "eval_data_path"]
-    output = ROOT / dataset["train_features_path" if is_train else "eval_features_path"]
+    source = resolve_path(dataset["train_data_path" if is_train else "eval_data_path"])
+    output = resolve_path(
+        dataset["train_features_path" if is_train else "eval_features_path"]
+    )
     samples = dataset["train_samples" if is_train else "eval_samples"]
     if not source.is_file():
         raise FileNotFoundError(
@@ -502,23 +586,42 @@ def _feature_command(
     if sample_limit is not None:
         samples = min(samples, sample_limit) if samples is not None else sample_limit
     command = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--standalone", "--nnodes=1", "--nproc_per_node=1", "--module",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        "--nproc_per_node=1",
+        "--module",
         "eagle3_olmo2.prepare_features",
-        "--target-model-path", model_path,
-        "--tokenizer-path", tokenizer_path,
-        "--strategy", "eagle3",
-        "--draft-model-config", str(draft_config_path),
-        "--data-path", str(source),
-        "--output-path", str(output),
-        "--chat-template", dataset["chat_template"],
-        "--max-length", str(dataset["max_length"]),
-        "--batch-size", str(dataset.get("preprocessing_batch_size", 1)),
-        "--build-dataset-num-proc", "1",
-        "--num-workers", "2",
-        "--cache-dir", str(ROOT / dataset["cache_dir"]),
-        "--sglang-attention-backend", model_cfg.get("capture_attention_backend", "triton"),
-        "--sglang-mem-fraction-static", str(model_cfg.get("sglang_mem_fraction_static", 0.35)),
+        "--target-model-path",
+        model_path,
+        "--tokenizer-path",
+        tokenizer_path,
+        "--strategy",
+        "eagle3",
+        "--draft-model-config",
+        str(draft_config_path),
+        "--data-path",
+        str(source),
+        "--output-path",
+        str(output),
+        "--chat-template",
+        dataset["chat_template"],
+        "--max-length",
+        str(dataset["max_length"]),
+        "--batch-size",
+        str(dataset.get("preprocessing_batch_size", 1)),
+        "--build-dataset-num-proc",
+        "1",
+        "--num-workers",
+        "2",
+        "--cache-dir",
+        str(resolve_path(dataset["cache_dir"])),
+        "--sglang-attention-backend",
+        model_cfg.get("capture_attention_backend", "triton"),
+        "--sglang-mem-fraction-static",
+        str(model_cfg.get("sglang_mem_fraction_static", 0.35)),
     ]
     if split == "eval":
         with evaluation_config_path.open(encoding="utf-8") as stream:
@@ -532,27 +635,36 @@ def _feature_command(
 
 
 def _run_inference(
-    config: dict[str, object], output_config: Path,
-    evaluation_config_path: Path, tokenizer_path: str,
+    config: dict[str, object],
+    output_config: Path,
+    evaluation_config_path: Path,
+    tokenizer_path: str,
 ) -> None:
-    output_dir = Path(str(config["output_dir"]))
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
+    output_dir = resolve_path(str(config["output_dir"]))
     run_id = str(config["run_id"])
     checkpoint_root = output_dir
     best = checkpoint_root / f"{run_id}-best"
     latest = checkpoint_root / f"{run_id}-latest"
     checkpoint = best if best.exists() else latest
     if not checkpoint.exists():
-        raise FileNotFoundError(f"no SpecForge best/latest checkpoint found under {checkpoint_root}")
+        raise FileNotFoundError(
+            f"no SpecForge best/latest checkpoint found under {checkpoint_root}"
+        )
     draft_dir = output_dir / "draft_sglang"
     _run(
         [
-            "specforge", "export", "--to", "sglang",
-            "--checkpoint", str(checkpoint),
-            "--draft-config", config["model"]["draft_model_config"],
-            "--output-dir", str(draft_dir),
-            "--vocab-mapping", config["model"]["vocab_mapping_path"],
+            "specforge",
+            "export",
+            "--to",
+            "sglang",
+            "--checkpoint",
+            str(checkpoint),
+            "--draft-config",
+            config["model"]["draft_model_config"],
+            "--output-dir",
+            str(draft_dir),
+            "--vocab-mapping",
+            config["model"]["vocab_mapping_path"],
         ]
     )
     with evaluation_config_path.open(encoding="utf-8") as stream:
@@ -560,31 +672,61 @@ def _run_inference(
     target_path = config["model"]["target_model_path"]
     _run(
         [
-            sys.executable, "-m", "eagle3_olmo2.inference",
-            "--target-model", target_path,
-            "--tokenizer-path", tokenizer_path,
-            "--draft-model", str(draft_dir),
-            "--output", str(output_dir / "inference-smoke.json"),
-            "--port", str(evaluation["inference_port"]),
-            "--max-new-tokens", str(evaluation["inference_max_new_tokens"]),
+            sys.executable,
+            "-m",
+            "eagle3_olmo2.inference",
+            "--target-model",
+            target_path,
+            "--tokenizer-path",
+            tokenizer_path,
+            "--draft-model",
+            str(draft_dir),
+            "--output",
+            str(output_dir / "inference-smoke.json"),
+            "--port",
+            str(evaluation["inference_port"]),
+            "--max-new-tokens",
+            str(evaluation["inference_max_new_tokens"]),
         ]
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare-data", "prepare-features", "compose", "train", "inference", "full"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "prepare-data",
+            "prepare-features",
+            "compose",
+            "train",
+            "inference",
+            "full",
+        ),
+    )
     parser.add_argument("--split", choices=("train", "eval", "all"), default="all")
-    parser.add_argument("--limit", type=int, help="Use a deterministic small data subset for a smoke run")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Use a deterministic small data subset for a smoke run",
+    )
     parser.add_argument("--experiment", type=Path, default=DEFAULT_EXPERIMENT)
     parser.add_argument("--dataset-config", type=Path)
-    parser.add_argument("--output-config", type=Path, default=ROOT / "outputs/olmo2_1b_eagle3/run.yaml")
+    parser.add_argument(
+        "--output-config",
+        type=Path,
+        default=resolve_path(
+            Path(os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3")) / "run.yaml"
+        ),
+    )
     parser.add_argument("--cuda-visible-devices")
     args = parser.parse_args()
+    ensure_configured_storage_dirs()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     with args.experiment.open(encoding="utf-8") as stream:
-        infrastructure = yaml.safe_load(stream).get("infrastructure", {})
+        infrastructure = expand_env(yaml.safe_load(stream).get("infrastructure", {}))
+    _configure_tracking_environment(infrastructure)
     configured_device = infrastructure.get("device", "cuda:0")
     if args.cuda_visible_devices:
         visible_devices = args.cuda_visible_devices
@@ -600,10 +742,19 @@ def main() -> None:
             require_cuda()
         except RuntimeError as exc:
             parser.error(str(exc))
+        ensure_dvc_artifacts_available(ROOT)
 
     if args.command in ("prepare-data", "full"):
-        dataset_config_path = args.dataset_config or experiment_module_path(args.experiment, "dataset")
-        data_command = [sys.executable, "-m", "eagle3_olmo2.data", "--config", str(dataset_config_path)]
+        dataset_config_path = args.dataset_config or experiment_module_path(
+            args.experiment, "dataset"
+        )
+        data_command = [
+            sys.executable,
+            "-m",
+            "eagle3_olmo2.data",
+            "--config",
+            str(dataset_config_path),
+        ]
         if args.command == "prepare-data":
             data_command.extend(("--split", args.split))
         if args.limit is not None:
@@ -611,29 +762,59 @@ def main() -> None:
         _run(data_command)
     if args.command == "prepare-features":
         model_config_path = experiment_module_path(args.experiment, "model")
-        dataset_config_path = args.dataset_config or experiment_module_path(args.experiment, "dataset")
+        dataset_config_path = args.dataset_config or experiment_module_path(
+            args.experiment, "dataset"
+        )
         evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
         with model_config_path.open(encoding="utf-8") as stream:
             model_options = yaml.safe_load(stream)["model"]
         model_path, tokenizer_path = resolve_model_assets(
             model_config_path, experiment_output_dir(args.experiment)
         )
-        draft_config_path = (model_config_path.parent / model_options["draft_model_config"]).resolve()
-        for split in (("train", "eval") if args.split == "all" else (args.split,)):
-            _run(_feature_command(split, dataset_config_path, model_config_path, model_path, tokenizer_path, draft_config_path, evaluation_config_path, args.limit))
+        draft_config_path = (
+            model_config_path.parent / model_options["draft_model_config"]
+        ).resolve()
+        for split in ("train", "eval") if args.split == "all" else (args.split,):
+            _run(
+                _feature_command(
+                    split,
+                    dataset_config_path,
+                    model_config_path,
+                    model_path,
+                    tokenizer_path,
+                    draft_config_path,
+                    evaluation_config_path,
+                    args.limit,
+                )
+            )
         return
     if args.command == "full":
         model_config_path = experiment_module_path(args.experiment, "model")
-        dataset_config_path = args.dataset_config or experiment_module_path(args.experiment, "dataset")
+        dataset_config_path = args.dataset_config or experiment_module_path(
+            args.experiment, "dataset"
+        )
         evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
         with model_config_path.open(encoding="utf-8") as stream:
             model_options = yaml.safe_load(stream)["model"]
         model_path, tokenizer_path = resolve_model_assets(
             model_config_path, experiment_output_dir(args.experiment)
         )
-        draft_config_path = (model_config_path.parent / model_options["draft_model_config"]).resolve()
+        draft_config_path = (
+            model_config_path.parent / model_options["draft_model_config"]
+        ).resolve()
         for split in ("train", "eval"):
-            _run(_feature_command(split, dataset_config_path, model_config_path, model_path, tokenizer_path, draft_config_path, evaluation_config_path, args.limit))
+            _run(
+                _feature_command(
+                    split,
+                    dataset_config_path,
+                    model_config_path,
+                    model_path,
+                    tokenizer_path,
+                    draft_config_path,
+                    evaluation_config_path,
+                    args.limit,
+                )
+            )
     if args.command in ("compose", "train", "inference", "full"):
         model_config_path = experiment_module_path(args.experiment, "model")
         evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
@@ -645,14 +826,24 @@ def main() -> None:
             align_final_evaluation(config)
         validate_specforge(config)
         args.output_config.parent.mkdir(parents=True, exist_ok=True)
-        args.output_config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        args.output_config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
         print(f"Wrote SpecForge run config to {args.output_config}")
         if args.command in ("train", "full"):
-            _record_training(["specforge", "train", "--config", str(args.output_config)], config, args.output_config)
+            _record_training(
+                ["specforge", "train", "--config", str(args.output_config)],
+                config,
+                args.output_config,
+            )
         if args.command == "inference":
-            _run_inference(config, args.output_config, evaluation_config_path, tokenizer_path)
+            _run_inference(
+                config, args.output_config, evaluation_config_path, tokenizer_path
+            )
         elif args.command == "full":
-            _run_inference(config, args.output_config, evaluation_config_path, tokenizer_path)
+            _run_inference(
+                config, args.output_config, evaluation_config_path, tokenizer_path
+            )
 
 
 if __name__ == "__main__":

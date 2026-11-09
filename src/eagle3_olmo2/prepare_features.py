@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import runpy
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from eagle3_olmo2.paths import ensure_configured_storage_dirs, resolve_path
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_FORGE = ROOT / "specforge"
@@ -17,13 +20,16 @@ def _limit_capture_memory(native_args: list[str], torch) -> dict[str, int | floa
     """Cap SGLang's static allocation using current free VRAM and target size."""
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "OLMo-2 target feature extraction requires CUDA, but no CUDA device is available."
+            "OLMo-2 target feature extraction requires CUDA, but no CUDA "
+            "device is available."
         )
     free_bytes, total_bytes = torch.cuda.mem_get_info()
     target_parser = argparse.ArgumentParser(add_help=False)
     target_parser.add_argument("--target-model-path", required=True)
     fraction_parser = argparse.ArgumentParser(add_help=False)
-    fraction_parser.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
+    fraction_parser.add_argument(
+        "--sglang-mem-fraction-static", type=float, default=0.4
+    )
     target_args, _ = target_parser.parse_known_args(native_args)
     fraction_args, _ = fraction_parser.parse_known_args(native_args)
 
@@ -37,7 +43,11 @@ def _limit_capture_memory(native_args: list[str], torch) -> dict[str, int | floa
     parameters = 2 * vocab * hidden + layers * (
         4 * hidden * hidden + 3 * hidden * intermediate
     )
-    dtype_bytes = 4 if text_config.get("torch_dtype", config.get("torch_dtype")) == "float32" else 2
+    dtype_bytes = (
+        4
+        if text_config.get("torch_dtype", config.get("torch_dtype")) == "float32"
+        else 2
+    )
     estimated_weights = int(parameters * dtype_bytes * 1.2)
     reserve_bytes = max(1 << 30, int(total_bytes * 0.1))
     available_for_static = free_bytes - estimated_weights - reserve_bytes
@@ -58,9 +68,7 @@ def _limit_capture_memory(native_args: list[str], torch) -> dict[str, int | floa
             found_fraction = True
             break
     if not found_fraction:
-        native_args.extend(
-            ("--sglang-mem-fraction-static", str(effective_fraction))
-        )
+        native_args.extend(("--sglang-mem-fraction-static", str(effective_fraction)))
     return {
         "available_before_capture_bytes": int(free_bytes),
         "total_gpu_bytes": int(total_bytes),
@@ -73,7 +81,7 @@ def _limit_capture_memory(native_args: list[str], torch) -> dict[str, int | floa
 def register_olmo2_template() -> None:
     if str(SPEC_FORGE) not in sys.path:
         sys.path.insert(0, str(SPEC_FORGE))
-    from specforge.data.template import ChatTemplate, TEMPLATE_REGISTRY
+    from specforge.data.template import TEMPLATE_REGISTRY, ChatTemplate
 
     # This OLMo-2 Instruct revision uses role tokens and endoftext rather than
     # ChatML markers. The tokenizer renders messages via apply_chat_template;
@@ -99,6 +107,7 @@ def install_olmo2_capture_adapter() -> None:
 
 
 def main() -> None:
+    ensure_configured_storage_dirs()
     wrapper = argparse.ArgumentParser(add_help=False)
     wrapper.add_argument("--tokenizer-path")
     wrapper.add_argument("--local-rank", "--local_rank", type=int)
@@ -134,13 +143,17 @@ def main() -> None:
                     target_tokenizer, "chat_template", None
                 ):
                     raise ValueError(
-                        "configured tokenizer chat template differs from the target tokenizer"
+                        "configured tokenizer chat template differs from "
+                        "the target tokenizer"
                     )
             actual_vocab_size = len(tokenizer)
-            if expected_vocab_size is not None and actual_vocab_size > int(expected_vocab_size):
+            if expected_vocab_size is not None and actual_vocab_size > int(
+                expected_vocab_size
+            ):
                 raise ValueError(
                     "configured tokenizer vocabulary exceeds the target: "
-                    f"len(tokenizer)={actual_vocab_size}, target vocab_size={expected_vocab_size}"
+                    f"len(tokenizer)={actual_vocab_size}, "
+                    f"target vocab_size={expected_vocab_size}"
                 )
             return tokenizer
 
@@ -154,18 +167,35 @@ def main() -> None:
     try:
         runpy.run_path(str(script), run_name="__main__")
     except RuntimeError as exc:
-        if "out of memory" in str(exc).lower() or "cuda" in str(exc).lower():
+        error = str(exc)
+        error_lower = error.lower()
+        if "out of memory" in error_lower:
             raise RuntimeError(
-                "OLMo-2 feature capture failed in the CUDA/SGLang stage. Reduce "
-                "the configured capture batch size or sequence length and check "
+                "OLMo-2 feature capture ran out of GPU memory. Reduce the "
+                "configured capture batch size or sequence length and check "
                 "the reported available GPU memory."
+            ) from exc
+        if "nvcc" in error_lower or "compiler" in error_lower:
+            raise RuntimeError(
+                "OLMo-2 feature capture could not compile a CUDA/SGLang kernel. "
+                "Install the CUDA Toolkit (including nvcc) and a C++ compiler, "
+                "then ensure /usr/local/cuda/bin/nvcc exists or configure the "
+                "toolchain path expected by SGLang. Original error: "
+                f"{error}"
+            ) from exc
+        if "cuda" in error_lower:
+            raise RuntimeError(
+                "OLMo-2 feature capture failed in the CUDA/SGLang stage. "
+                f"Original error: {error}"
             ) from exc
         raise
     argv = sys.argv[1:]
     try:
         output_path = Path(argv[argv.index("--output-path") + 1])
     except (ValueError, IndexError):
-        output_path = ROOT / "outputs/olmo2_1b_eagle3"
+        output_path = resolve_path(
+            Path(os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3"))
+        )
     output_path.mkdir(parents=True, exist_ok=True)
     memory.update(
         peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -175,7 +205,8 @@ def main() -> None:
         json.dumps(
             {"recorded_at_utc": datetime.now(timezone.utc).isoformat(), **memory},
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 

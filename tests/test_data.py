@@ -1,7 +1,7 @@
-import unittest
 import json
 import sys
 import types
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -30,9 +30,7 @@ class NormalizeMessagesTest(unittest.TestCase):
 
     def test_sharegpt_fields_are_normalized(self):
         self.assertEqual(
-            normalize_messages(
-                {"conversations": [{"from": "gpt", "value": "answer"}]}
-            ),
+            normalize_messages({"conversations": [{"from": "gpt", "value": "answer"}]}),
             [{"role": "assistant", "content": "answer"}],
         )
 
@@ -69,22 +67,28 @@ class NormalizeMessagesTest(unittest.TestCase):
 
         fake_datasets = types.ModuleType("datasets")
 
-        def load_dataset(name, split, revision):
+        def load_dataset(name, split, revision, cache_dir=None):
             observed["load_revision"] = revision
+            observed["cache_dir"] = cache_dir
             return FakeDataset(
                 [
-                    {"messages": [
-                        {"role": "user", "content": "question"},
-                        {"role": "assistant", "content": "answer"},
-                    ]}
+                    {
+                        "messages": [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ]
+                    }
                 ]
             )
 
         fake_datasets.load_dataset = load_dataset
         fake_hub = types.ModuleType("huggingface_hub")
         fake_hub.HfApi = FakeHubApi
-        with TemporaryDirectory() as directory, patch.dict(
-            sys.modules, {"datasets": fake_datasets, "huggingface_hub": fake_hub}
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict(
+                sys.modules, {"datasets": fake_datasets, "huggingface_hub": fake_hub}
+            ),
         ):
             output = Path(directory) / "train.jsonl"
             count = prepare_split(
@@ -94,12 +98,14 @@ class NormalizeMessagesTest(unittest.TestCase):
                 output=output,
                 seed=7,
                 limit=1,
+                cache_dir=Path(directory) / "hf-cache",
             )
             manifest = json.loads(
                 output.with_suffix(".jsonl.manifest.json").read_text(encoding="utf-8")
             )
         self.assertEqual(count, 1)
         self.assertEqual(observed["load_revision"], "immutable-sha")
+        self.assertEqual(observed["cache_dir"], str(Path(directory) / "hf-cache"))
         self.assertEqual(manifest["resolved_revision"], "immutable-sha")
         self.assertEqual(manifest["datasets_fingerprint"], "fake-fingerprint")
 

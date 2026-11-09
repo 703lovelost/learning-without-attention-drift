@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.ipynb_checkpoints/
+data/*
+!data/*.dvc
+!data/.gitignore
+outputs/*
+!outputs/*.dvc
+!outputs/.gitignore
+mlruns/
+docs/*
+!docs/implementation-status.md
+!docs/project-goals.md
+.env

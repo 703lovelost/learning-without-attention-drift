@@ -36,7 +36,9 @@ class PipelineSmokeTest(unittest.TestCase):
             model_dir = work / "configs/models"
             model_dir.mkdir(parents=True)
             draft_config = model_dir / "olmo2_eagle3.json"
-            draft_config.write_bytes((ROOT / "configs/models/olmo2_1b_eagle3.json").read_bytes())
+            draft_config.write_bytes(
+                (ROOT / "configs/models/olmo2_1b_eagle3.json").read_bytes()
+            )
             model_config = {
                 "model": {
                     "target_model_path": os.getenv(
@@ -46,7 +48,9 @@ class PipelineSmokeTest(unittest.TestCase):
                     "tokenizer_path": os.getenv(
                         "EAGLE3_OLMO2_TOKENIZER_ID", "allenai/OLMo-2-0425-1B-Instruct"
                     ),
-                    "tokenizer_revision": os.getenv("EAGLE3_OLMO2_TOKENIZER_REVISION", "main"),
+                    "tokenizer_revision": os.getenv(
+                        "EAGLE3_OLMO2_TOKENIZER_REVISION", "main"
+                    ),
                     "draft_architecture": "LlamaForCausalLMEagle3",
                     "draft_model_config": str(draft_config),
                     "draft_vocab_size": 32000,
@@ -120,7 +124,9 @@ class PipelineSmokeTest(unittest.TestCase):
                 ("evaluation", evaluation_config),
             ):
                 path = work / f"{name}.yaml"
-                path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+                path.write_text(
+                    yaml.safe_dump(value, sort_keys=False), encoding="utf-8"
+                )
 
             mlruns_uri = f"sqlite:///{work / 'mlflow.db'}"
             experiment = {
@@ -140,24 +146,35 @@ class PipelineSmokeTest(unittest.TestCase):
                 },
             }
             experiment_path = work / "experiment.yaml"
-            experiment_path.write_text(yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8")
+            experiment_path.write_text(
+                yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8"
+            )
             run_config = work / "run.yaml"
             env = os.environ.copy()
             env["PYTHONPATH"] = f"{ROOT / 'src'}:{env.get('PYTHONPATH', '')}"
             env.pop("MLFLOW_TRACKING_URI", None)
             cuda_devices = os.getenv("EAGLE3_CUDA_VISIBLE_DEVICES", "0")
             cli = [
-                sys.executable, "-m", "eagle3_olmo2.cli", "full",
-                "--experiment", str(experiment_path),
-                "--output-config", str(run_config),
-                "--limit", "8",
-                "--cuda-visible-devices", cuda_devices,
+                sys.executable,
+                "-m",
+                "eagle3_olmo2.cli",
+                "full",
+                "--experiment",
+                str(experiment_path),
+                "--output-config",
+                str(run_config),
+                "--limit",
+                "8",
+                "--cuda-visible-devices",
+                cuda_devices,
             ]
             subprocess.run(cli, cwd=ROOT, env=env, check=True, timeout=7200)
 
             output_dir = work / "outputs"
             self.assertTrue((output_dir / "olmo2-eagle3-gpu-smoke-best").exists())
-            self.assertTrue((output_dir / "olmo2-eagle3-gpu-smoke.best_meta.json").exists())
+            self.assertTrue(
+                (output_dir / "olmo2-eagle3-gpu-smoke.best_meta.json").exists()
+            )
             best_meta = json.loads(
                 (output_dir / "olmo2-eagle3-gpu-smoke.best_meta.json").read_text()
             )
@@ -166,8 +183,12 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue((output_dir / "inference-smoke.json").exists())
             inference = json.loads((output_dir / "inference-smoke.json").read_text())
             self.assertTrue(inference["response"].get("text"))
-            self.assertTrue((work / "features/train/feature-extraction-memory.json").exists())
-            self.assertTrue((work / "features/eval/feature-extraction-memory.json").exists())
+            self.assertTrue(
+                (work / "features/train/feature-extraction-memory.json").exists()
+            )
+            self.assertTrue(
+                (work / "features/eval/feature-extraction-memory.json").exists()
+            )
             metrics = [
                 json.loads(line)
                 for line in (output_dir / "metrics.jsonl").read_text().splitlines()
@@ -198,17 +219,23 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertIsNotNone(resume_state["backend"].get("optimizer"))
             self.assertIsNotNone(resume_state["backend"].get("rng"))
 
-            experiment["infrastructure"]["resume_from_checkpoint"] = str(
-                resume_source
-            )
+            experiment["infrastructure"]["resume_from_checkpoint"] = str(resume_source)
             experiment["infrastructure"]["mlflow_tracking_uri"] = None
-            experiment_path.write_text(yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8")
+            experiment_path.write_text(
+                yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8"
+            )
             env.pop("MLFLOW_TRACKING_URI", None)
             train_cli = [
-                sys.executable, "-m", "eagle3_olmo2.cli", "train",
-                "--experiment", str(experiment_path),
-                "--output-config", str(run_config),
-                "--cuda-visible-devices", cuda_devices,
+                sys.executable,
+                "-m",
+                "eagle3_olmo2.cli",
+                "train",
+                "--experiment",
+                str(experiment_path),
+                "--output-config",
+                str(run_config),
+                "--cuda-visible-devices",
+                cuda_devices,
             ]
             subprocess.run(train_cli, cwd=ROOT, env=env, check=True, timeout=1800)
             resumed_state = CheckpointManager.read_resume_state(
@@ -224,7 +251,9 @@ class PipelineSmokeTest(unittest.TestCase):
             experiment["experiment"]["name"] = "olmo2-eagle3-local-smoke"
             experiment["infrastructure"]["output_dir"] = str(local_output)
             experiment["infrastructure"]["resume_from_checkpoint"] = None
-            experiment_path.write_text(yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8")
+            experiment_path.write_text(
+                yaml.safe_dump(experiment, sort_keys=False), encoding="utf-8"
+            )
             subprocess.run(train_cli, cwd=ROOT, env=env, check=True, timeout=1800)
             local_metrics = [
                 json.loads(line)
@@ -247,7 +276,9 @@ class PipelineSmokeTest(unittest.TestCase):
             )
             self.assertTrue(client.list_artifacts(runs[0].info.run_id, "plots"))
             self.assertTrue(
-                client.get_run(runs[0].info.run_id).data.params.get("training.optimizer")
+                client.get_run(runs[0].info.run_id).data.params.get(
+                    "training.optimizer"
+                )
             )
 
 

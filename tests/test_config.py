@@ -1,26 +1,76 @@
 import json
 import os
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from eagle3_olmo2.config import DEFAULT_EXPERIMENT, compose, validate_specforge
 from eagle3_olmo2.cli import (
+    _configure_tracking_environment,
     _discard_future_best,
     _feature_command,
     _log_mlflow_artifacts,
-    require_cuda,
-    _write_svg,
     _target_head_compatible_snapshot,
+    _write_metric_plots,
+    _write_svg,
     align_final_evaluation,
+    require_cuda,
     resolve_model_assets,
 )
+from eagle3_olmo2.config import DEFAULT_EXPERIMENT, compose, validate_specforge
 
 
 class ConfigCompositionTest(unittest.TestCase):
+    def test_pipeline_paths_follow_storage_environment(self):
+        with TemporaryDirectory() as directory:
+            storage = Path(directory)
+            with patch.dict(
+                os.environ,
+                {
+                    "EAGLE3_DATA_DIR": str(storage / "data"),
+                    "EAGLE3_OUTPUT_DIR": str(storage / "outputs"),
+                    "EAGLE3_CACHE_DIR": str(storage / "cache"),
+                },
+            ):
+                config = compose(DEFAULT_EXPERIMENT)
+
+        self.assertEqual(
+            config["data"]["hidden_states_path"], str(storage / "data/features/train")
+        )
+        self.assertEqual(
+            config["data"]["eval_hidden_states_path"],
+            str(storage / "data/features/eval"),
+        )
+        self.assertEqual(config["model"]["cache_dir"], str(storage / "cache"))
+        self.assertEqual(config["output_dir"], str(storage / "outputs"))
+        self.assertEqual(
+            config["model"]["vocab_mapping_path"],
+            str(storage / "data/features/train/vocab_mapping/vocab_mapping.pt"),
+        )
+
+    def test_experiment_tracking_uri_is_passed_to_child_environment(self):
+        tracking_uri = "sqlite:////tmp/eagle3-test-mlflow.db"
+        with patch.dict(os.environ, {}, clear=True):
+            _configure_tracking_environment({"mlflow_tracking_uri": tracking_uri})
+            self.assertEqual(os.environ["MLFLOW_TRACKING_URI"], tracking_uri)
+
+    def test_explicit_tracking_environment_takes_precedence(self):
+        configured_uri = "sqlite:////tmp/configured.db"
+        environment_uri = "sqlite:////tmp/environment.db"
+        with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": environment_uri}):
+            _configure_tracking_environment({"mlflow_tracking_uri": configured_uri})
+            self.assertEqual(os.environ["MLFLOW_TRACKING_URI"], environment_uri)
+
+    def test_tracking_uri_credentials_stay_out_of_resolved_config(self):
+        secret_uri = "https://user:private-token@example.invalid/mlflow"
+        with patch.dict(os.environ, {"MLFLOW_TRACKING_URI": secret_uri}):
+            config = compose(DEFAULT_EXPERIMENT)
+        self.assertEqual(config["tracking"]["report_to"], "mlflow")
+        self.assertIsNone(config["tracking"]["mlflow_tracking_uri"])
+        self.assertNotIn("private-token", repr(config))
+
     def test_compose_produces_offline_eagle3_config(self):
         config = compose(DEFAULT_EXPERIMENT, target_model_path="/models/olmo2")
         self.assertEqual(config["model"]["target_model_path"], "/models/olmo2")
@@ -28,10 +78,13 @@ class ConfigCompositionTest(unittest.TestCase):
         self.assertNotIn("optimizer", config["training"])
         self.assertEqual(config["training"]["lr_scheduler"], "cosine")
         self.assertEqual(config["data"]["hidden_states_path"], "data/features/train")
-        self.assertEqual(config["data"]["eval_hidden_states_path"], "data/features/eval")
+        self.assertEqual(
+            config["data"]["eval_hidden_states_path"], "data/features/eval"
+        )
         self.assertEqual(config["training"]["ttt_length"], 7)
         expected_tracker = "mlflow" if os.getenv("MLFLOW_TRACKING_URI") else "none"
         self.assertEqual(config["tracking"]["report_to"], expected_tracker)
+        self.assertIsNone(config["tracking"]["mlflow_tracking_uri"])
         validate_specforge(config)
 
     def test_metric_plot_is_written_as_svg(self):
@@ -39,6 +92,30 @@ class ConfigCompositionTest(unittest.TestCase):
             plot = Path(directory) / "loss.svg"
             _write_svg(plot, [(1, 2.0), (2, 1.0)], "train/loss")
             self.assertIn("<svg", plot.read_text(encoding="utf-8"))
+
+    def test_metric_plot_writer_covers_loss_acceptance_and_acceptance_rate(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            _write_metric_plots(
+                {
+                    "train/loss": [(1, 2.0), (2, 1.0)],
+                    "eval/avg_loss": [(1, 1.5), (2, 0.8)],
+                    "eval/simulated_acc_len": [(1, 1.1), (2, 1.4)],
+                    "eval/acceptance_rate_1": [(1, 0.5), (2, 0.7)],
+                },
+                output_dir,
+            )
+            plots = sorted(path.name for path in output_dir.glob("*.svg"))
+
+        self.assertEqual(
+            plots,
+            [
+                "acceptance_length.svg",
+                "eval_acceptance_rate_1.svg",
+                "train_loss.svg",
+                "validation_loss.svg",
+            ],
+        )
 
     def test_cuda_preflight_fails_with_driver_guidance(self):
         fake_torch = types.SimpleNamespace(
@@ -98,24 +175,31 @@ class ConfigCompositionTest(unittest.TestCase):
             eval_features.mkdir(parents=True)
             (output / "metrics.jsonl").write_text('{"step": 7, "loss": 1.0}\n')
             (output / "gpu-memory.json").write_text(
-                json.dumps({
-                    "peak_used_mib": 5000,
-                    "peak_training_used_mib": 4500,
-                    "peak_evaluation_used_mib": 4800,
-                })
+                json.dumps(
+                    {
+                        "peak_used_mib": 5000,
+                        "peak_training_used_mib": 4500,
+                        "peak_evaluation_used_mib": 4800,
+                    }
+                )
             )
             for features in (train_features, eval_features):
                 (features / "feature-extraction-memory.json").write_text(
-                    json.dumps({
-                        "peak_allocated_bytes": 1048576,
-                        "peak_reserved_bytes": 2097152,
-                    })
+                    json.dumps(
+                        {
+                            "peak_allocated_bytes": 1048576,
+                            "peak_reserved_bytes": 2097152,
+                        }
+                    )
                 )
             config_path = root / "run.yaml"
             config_path.write_text("model: {}\ntraining: {}\n")
             config = {
                 "run_id": "olmo2",
-                "tracking": {"mlflow_tracking_uri": None, "mlflow_experiment_name": "e"},
+                "tracking": {
+                    "mlflow_tracking_uri": None,
+                    "mlflow_experiment_name": "e",
+                },
                 "data": {
                     "hidden_states_path": str(train_features),
                     "eval_hidden_states_path": str(eval_features),
@@ -135,6 +219,9 @@ class ConfigCompositionTest(unittest.TestCase):
         self.assertEqual(logged["gpu/capture_train_peak_reserved_mib"], (2.0, 7))
         self.assertEqual(logged["gpu/capture_eval_peak_reserved_mib"], (2.0, 7))
         self.assertIn(("training.optimizer", "adamw"), calls["params"])
+        self.assertTrue(
+            any(name == "project.git_commit" for name, _ in calls["params"])
+        )
 
     def test_eval_interval_lands_on_final_offline_update(self):
         config = compose(DEFAULT_EXPERIMENT, target_model_path="/models/olmo2")
@@ -166,7 +253,9 @@ class ConfigCompositionTest(unittest.TestCase):
                 encoding="utf-8",
             )
             output_dir = root / "outputs"
-            resolved_model, resolved_tokenizer = resolve_model_assets(config_path, output_dir)
+            resolved_model, resolved_tokenizer = resolve_model_assets(
+                config_path, output_dir
+            )
             self.assertEqual(resolved_model, str(model_path.resolve()))
             self.assertEqual(resolved_tokenizer, str(tokenizer_path.resolve()))
             manifest = json.loads((output_dir / "model-snapshot.json").read_text())
@@ -181,13 +270,23 @@ class ConfigCompositionTest(unittest.TestCase):
             root = Path(directory)
             snapshot = root / "snapshot"
             snapshot.mkdir()
-            save_file({"lm_head.weight": torch.zeros(2, 2)}, snapshot / "model.safetensors")
+            save_file(
+                {
+                    "lm_head.weight": torch.zeros(2, 2),
+                    "model.embed_tokens.weight": torch.zeros(2, 2),
+                },
+                snapshot / "model.safetensors",
+            )
             (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
 
-            compatible = Path(_target_head_compatible_snapshot(str(snapshot), root / "out"))
+            compatible = Path(
+                _target_head_compatible_snapshot(str(snapshot), root / "out")
+            )
             self.assertEqual(compatible.name, "model-with-index")
             self.assertTrue((compatible / "config.json").is_symlink())
-            index = json.loads((compatible / "model.safetensors.index.json").read_text())
+            index = json.loads(
+                (compatible / "model.safetensors.index.json").read_text()
+            )
             self.assertEqual(index["weight_map"]["lm_head.weight"], "model.safetensors")
             self.assertEqual(
                 index["weight_map"]["model.embed_tokens.weight"],
@@ -229,8 +328,13 @@ class ConfigCompositionTest(unittest.TestCase):
             evaluation_path.write_text("evaluation: {}\n", encoding="utf-8")
 
             command = _feature_command(
-                "train", dataset_path, model_config_path, "/models/target",
-                "/models/tokenizer", draft_config_path, evaluation_path,
+                "train",
+                dataset_path,
+                model_config_path,
+                "/models/target",
+                "/models/tokenizer",
+                draft_config_path,
+                evaluation_path,
             )
 
             self.assertEqual(command[1:3], ["-m", "torch.distributed.run"])
@@ -244,15 +348,26 @@ class ConfigCompositionTest(unittest.TestCase):
             )
 
             limited_command = _feature_command(
-                "train", dataset_path, model_config_path, "/models/target",
-                "/models/tokenizer", draft_config_path, evaluation_path, 1,
+                "train",
+                dataset_path,
+                model_config_path,
+                "/models/target",
+                "/models/tokenizer",
+                draft_config_path,
+                evaluation_path,
+                1,
             )
             sample_arg = limited_command.index("--num-samples")
             self.assertEqual(limited_command[sample_arg + 1], "1")
 
             eval_command = _feature_command(
-                "eval", dataset_path, model_config_path, "/models/target",
-                "/models/tokenizer", draft_config_path, evaluation_path,
+                "eval",
+                dataset_path,
+                model_config_path,
+                "/models/target",
+                "/models/tokenizer",
+                draft_config_path,
+                evaluation_path,
             )
             sample_arg = eval_command.index("--num-samples")
             self.assertEqual(eval_command[sample_arg + 1], "2")

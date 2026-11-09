@@ -98,4 +98,3 @@ def install_olmo2_eagle3_capture_adapter() -> None:
     Olmo2ForCausalLM.set_eagle3_layers_to_capture = set_eagle3_layers_to_capture
     Olmo2ForCausalLM.get_embed_and_head = get_embed_and_head
     Olmo2ForCausalLM._eagle3_capture_adapter_installed = True
-
