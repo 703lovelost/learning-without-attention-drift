@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import runpy
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from eagle3_olmo2.data import sha256_file
 from eagle3_olmo2.paths import ensure_configured_storage_dirs, resolve_path
+from eagle3_olmo2.readiness import audit_features, write_json
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_FORGE = ROOT / "specforge"
@@ -106,10 +110,62 @@ def install_olmo2_capture_adapter() -> None:
     install_olmo2_eagle3_capture_adapter()
 
 
+def eligible_examples(dataset, max_length: int):
+    """Match EAGLE-3's effective loss mask after the final token is cleared."""
+    valid = []
+    loss_tokens = 0
+    lengths = []
+    for index, row in enumerate(dataset.select_columns(["input_ids", "loss_mask"])):
+        mask = row["loss_mask"].reshape(-1)
+        count = int(mask[:-1].sum())
+        if count:
+            valid.append(index)
+            loss_tokens += count
+            lengths.append(row["input_ids"].numel())
+    if not valid:
+        raise ValueError("No examples with assistant loss tokens after truncation")
+    return dataset.select(valid), {
+        "preprocessed_rows": len(dataset),
+        "rejected_empty_masks": len(dataset) - len(valid),
+        "loss_tokens": loss_tokens,
+        "min_tokens": min(lengths),
+        "max_tokens": max(lengths),
+        "rows_at_context_limit": lengths.count(max_length),
+        "eligible_rows": len(valid),
+    }
+
+
+def _install_preprocessing_audit(source: Path, seed: int, stats: dict) -> None:
+    from specforge.data import preprocessing
+
+    native = preprocessing.build_eagle3_dataset
+    source_hash = sha256_file(source)
+
+    def audited_build(*args, **kwargs):
+        tokenizer = kwargs["tokenizer"]
+        template_hash = hashlib.sha256(tokenizer.chat_template.encode()).hexdigest()
+        # Native cache identity uses the source path. Include content and the
+        # actual template so stale preprocessing cannot enter the capture.
+        kwargs["cache_key"] += f"-{source_hash}-{template_hash}-{seed}"
+        kwargs["shuffle_seed"] = seed
+        if kwargs.get("num_proc") == 1:
+            kwargs["num_proc"] = None
+        dataset, statistics = eligible_examples(
+            native(*args, **kwargs), kwargs["max_length"]
+        )
+        stats.update(
+            statistics, source_sha256=source_hash, chat_template_sha256=template_hash
+        )
+        return dataset
+
+    preprocessing.build_eagle3_dataset = audited_build
+
+
 def main() -> None:
     ensure_configured_storage_dirs()
     wrapper = argparse.ArgumentParser(add_help=False)
     wrapper.add_argument("--tokenizer-path")
+    wrapper.add_argument("--capture-seed", type=int, default=42)
     wrapper.add_argument("--local-rank", "--local_rank", type=int)
     wrapper_args, native_args = wrapper.parse_known_args()
     sys.argv = [sys.argv[0], *native_args]
@@ -161,7 +217,20 @@ def main() -> None:
     script = SPEC_FORGE / "scripts/prepare_hidden_states.py"
     import torch
 
+    def argument(name: str) -> str:
+        return native_args[native_args.index(name) + 1]
+
+    stats: dict = {}
+    _install_preprocessing_audit(
+        Path(argument("--data-path")), wrapper_args.capture_seed, stats
+    )
+    target_config = json.loads(
+        (Path(argument("--target-model-path")) / "config.json").read_text(
+            encoding="utf-8"
+        )
+    )
     memory = _limit_capture_memory(native_args, torch)
+    started = time.monotonic()
     sys.argv = [sys.argv[0], *native_args]
     torch.cuda.reset_peak_memory_stats()
     try:
@@ -196,7 +265,16 @@ def main() -> None:
         output_path = resolve_path(
             Path(os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3"))
         )
-    output_path.mkdir(parents=True, exist_ok=True)
+    stats.update(
+        audit_features(
+            output_path,
+            target_config,
+            stats["eligible_rows"],
+            int(argument("--max-length")),
+        ),
+        capture_wall_seconds=time.monotonic() - started,
+    )
+    write_json(output_path / "capture-audit.json", stats)
     memory.update(
         peak_allocated_bytes=torch.cuda.max_memory_allocated(),
         peak_reserved_bytes=torch.cuda.max_memory_reserved(),

@@ -22,3 +22,9 @@ cli:
   split: all
   cuda_visible_devices: null
   output_config: null
+  checkpoint: null
+  mode: null
+  suite: null
+  prompt: null
+  trace: false
+  approved_pilot: null

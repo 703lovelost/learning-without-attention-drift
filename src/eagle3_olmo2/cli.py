@@ -1,16 +1,20 @@
-"""Run the modular OLMo-2/SpecForge offline EAGLE-3 pipeline."""
+"""Run the modular OLMo-2/SpecForge EAGLE-3 pipeline."""
 
 from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
-import math
 import os
 import re
+import resource
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -23,8 +27,22 @@ from eagle3_olmo2.config import (
     experiment_module_path,
     validate_specforge,
 )
-from eagle3_olmo2.dvc import ensure_dvc_artifacts_available
+from eagle3_olmo2.data import sha256_file
+from eagle3_olmo2.dvc import ensure_dvc_artifacts_available, register_artifact
+from eagle3_olmo2.metrics import METRIC_SCHEMA, canonical_metrics
 from eagle3_olmo2.paths import ensure_configured_storage_dirs, expand_env, resolve_path
+from eagle3_olmo2.readiness import (
+    asset_identity,
+    estimate_capture_storage,
+    feature_manifest,
+    plan_training,
+    write_json,
+)
+from eagle3_olmo2.train_data import (
+    TRAIN_INPUT_DIGEST,
+    TRAIN_INPUT_MANIFEST,
+    prepare_training_inputs,
+)
 
 
 def read_dataset_config(path: Path) -> dict:
@@ -46,40 +64,6 @@ def experiment_output_dir(experiment_path: Path) -> Path:
         os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3"),
     )
     return resolve_path(output_dir)
-
-
-def align_final_evaluation(config: dict[str, object]) -> None:
-    """Make the configured evaluation cadence land on the final offline step."""
-    data = config["data"]
-    training = config["training"]
-    feature_root = Path(data["hidden_states_path"])
-    if not feature_root.is_absolute():
-        feature_root = ROOT / feature_root
-    if not feature_root.exists():
-        return
-    samples = sum(
-        1
-        for path in feature_root.rglob("*")
-        if path.is_file()
-        and (path.name.endswith(".ckpt") or path.name.endswith(".ckpt.gz"))
-    )
-    update_quantum = training["batch_size"] * training["accumulation_steps"]
-    updates_per_epoch = samples // update_quantum
-    total_updates = updates_per_epoch * training["num_epochs"]
-    if training.get("max_steps") is not None:
-        total_updates = min(total_updates, training["max_steps"])
-    interval = training["eval_interval"]
-    if interval > 0:
-        training["log_interval"] = math.gcd(training["log_interval"], interval)
-    if total_updates > 0 and interval > 0 and total_updates % interval:
-        adjusted = math.gcd(interval, total_updates)
-        print(
-            f"Adjusting evaluation interval from {interval} to {adjusted} so the "
-            f"final offline optimizer step {total_updates} is evaluated.",
-            flush=True,
-        )
-        training["eval_interval"] = adjusted
-        training["log_interval"] = math.gcd(training["log_interval"], adjusted)
 
 
 def _resolve_snapshot(repo_or_path: str, revision: str, *, relative_to: Path) -> str:
@@ -109,28 +93,30 @@ def _target_head_compatible_snapshot(model_path: str, output_dir: Path) -> str:
         return model_path
 
     overlay = output_dir / "model-with-index"
-    overlay.mkdir(parents=True, exist_ok=True)
-    for asset in source.iterdir():
-        destination = overlay / asset.name
-        if destination.exists() or destination.is_symlink():
-            destination.unlink()
-        destination.symlink_to(asset.resolve())
+    if (overlay / "model.safetensors.index.json").is_file():
+        return str(overlay.resolve())
     from safetensors import safe_open
 
-    with safe_open(str(source / "model.safetensors"), framework="pt") as weights:
-        weight_map = {key: "model.safetensors" for key in weights.keys()}
-    (overlay / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {"weight_map": weight_map},
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".target-index-", dir=output_dir) as work:
+        staging = Path(work) / overlay.name
+        staging.mkdir()
+        for asset in source.iterdir():
+            (staging / asset.name).symlink_to(asset.resolve())
+        with safe_open(str(source / "model.safetensors"), framework="pt") as weights:
+            weight_map = {key: "model.safetensors" for key in weights.keys()}
+        write_json(staging / "model.safetensors.index.json", {"weight_map": weight_map})
+        try:
+            staging.rename(overlay)
+        except OSError:
+            if not (overlay / "model.safetensors.index.json").is_file():
+                raise
     return str(overlay.resolve())
 
 
-def resolve_model_assets(model_config_path: Path, output_dir: Path) -> tuple[str, str]:
+def resolve_model_assets(
+    model_config_path: Path, output_dir: Path, *, cache_dir: Path | None = None
+) -> tuple[str, str]:
     """Resolve model and tokenizer revisions to immutable local snapshots."""
     with model_config_path.open(encoding="utf-8") as stream:
         model = yaml.safe_load(stream)["model"]
@@ -138,7 +124,11 @@ def resolve_model_assets(model_config_path: Path, output_dir: Path) -> tuple[str
     resolved_model = _resolve_snapshot(
         model_id, model.get("revision", "main"), relative_to=model_config_path.parent
     )
-    indexed_model = _target_head_compatible_snapshot(resolved_model, output_dir)
+    overlay_root = output_dir
+    if cache_dir is not None:
+        snapshot_key = hashlib.sha256(resolved_model.encode()).hexdigest()
+        overlay_root = cache_dir / "target-overlays" / snapshot_key
+    indexed_model = _target_head_compatible_snapshot(resolved_model, overlay_root)
     tokenizer_id = model.get("tokenizer_path") or model_id
     resolved_tokenizer = _resolve_snapshot(
         tokenizer_id,
@@ -196,38 +186,6 @@ def require_cuda() -> None:
         )
 
 
-def _discard_future_best(output_dir: Path, run_id: str, resume_step: int) -> bool:
-    """Drop a best alias from a later step when resuming an earlier branch."""
-    metadata_path = output_dir / f"{run_id}.best_meta.json"
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        best_step = int(metadata["step"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-    if best_step <= resume_step:
-        return False
-    best_link = output_dir / f"{run_id}-best"
-    if best_link.is_symlink():
-        best_link.unlink()
-    metadata_path.unlink()
-    print(
-        f"Cleared best-checkpoint metadata at step {best_step}; resuming from "
-        f"step {resume_step} starts a new checkpoint timeline.",
-        flush=True,
-    )
-    return True
-
-
-def _reconcile_best_for_resume(config: dict[str, object], output_dir: Path) -> None:
-    resume_from = config["training"].get("resume_from")
-    if not resume_from:
-        return
-    from specforge.training.checkpoint import CheckpointManager
-
-    state = CheckpointManager.read_resume_state(str(resume_from))
-    _discard_future_best(output_dir, str(config["run_id"]), int(state["global_step"]))
-
-
 def _write_svg(path: Path, points: list[tuple[int, float]], title: str) -> None:
     if not points:
         return
@@ -263,7 +221,7 @@ def _plot_name(metric: str) -> str | None:
     aliases = {
         "loss": "train_loss",
         "train/loss": "train_loss",
-        "eval/avg_loss": "validation_loss",
+        "eval/loss": "validation_loss",
         "val/loss": "validation_loss",
         "lr": "learning_rate",
         "train/lr": "learning_rate",
@@ -284,13 +242,11 @@ def _write_metric_plots(
 
 
 def _record_training(
-    command: list[str], config: dict[str, object], output_config: Path
+    command: list[str], config: dict[str, object], report_dir: Path
 ) -> None:
     """Stream native logs, save scalar history/charts, and sample GPU memory."""
-    output_dir = resolve_path(str(config["output_dir"]))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _reconcile_best_for_resume(config, output_dir)
-    log_path = output_dir / "metrics.jsonl"
+    log_path = report_dir / "metrics.jsonl"
+    write_json(report_dir / "metrics-schema.json", METRIC_SCHEMA)
     memory_result: dict[str, object] = {
         "status": "unavailable",
         "peak_used_mib": None,
@@ -378,6 +334,7 @@ def _record_training(
     sampler = threading.Thread(target=sample_memory, daemon=True)
     sampler.start()
     process_env = os.environ.copy()
+    process_env["EAGLE3_MLFLOW_RUN_ID_FILE"] = str(report_dir / "mlflow-run-id")
     tracker_bootstrap = str(Path(__file__).resolve().parent / "mlflow_bootstrap")
     existing_python_path = process_env.get("PYTHONPATH")
     process_env["PYTHONPATH"] = os.pathsep.join(
@@ -411,7 +368,7 @@ def _record_training(
             if is_eval_log:
                 current_phase[0] = "train"
             row = {"step": step}
-            for name, value in values.items():
+            for name, value in canonical_metrics(values).items():
                 try:
                     number = float(value)
                 except (TypeError, ValueError):
@@ -425,19 +382,18 @@ def _record_training(
                 eval_interval = config["training"]["eval_interval"]
                 if eval_interval > 0 and step % eval_interval == 0:
                     current_phase[0] = "eval"
-            _write_metric_plots(series, output_dir / "plots")
+    _write_metric_plots(series, report_dir / "plots")
     return_code = process.wait()
     stop_sampler.set()
     sampler.join(timeout=2)
-    (output_dir / "gpu-memory.json").write_text(
+    memory_result["peak_child_rss_kib"] = resource.getrusage(
+        resource.RUSAGE_CHILDREN
+    ).ru_maxrss
+    (report_dir / "gpu-memory.json").write_text(
         json.dumps(memory_result, indent=2) + "\n", encoding="utf-8"
     )
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
-    if os.getenv("MLFLOW_TRACKING_URI") or config.get("tracking", {}).get(
-        "mlflow_tracking_uri"
-    ):
-        _log_mlflow_artifacts(config, output_dir, output_config)
 
 
 def _log_mlflow_artifacts(
@@ -459,21 +415,7 @@ def _log_mlflow_artifacts(
         client = MlflowClient(tracking_uri=uri)
     else:
         client = MlflowClient()
-    experiment = client.get_experiment_by_name(
-        config["tracking"].get("mlflow_experiment_name") or "eagle3-olmo2"
-    )
-    if experiment is None:
-        return
-    run_name = config.get("run_id", "olmo2-eagle3")
-    runs = client.search_runs(
-        [experiment.experiment_id],
-        filter_string=f"attributes.run_name = '{run_name}'",
-        order_by=["attributes.start_time DESC"],
-        max_results=1,
-    )
-    if not runs:
-        return
-    run_id = runs[0].info.run_id
+    run_id = (output_dir / "mlflow-run-id").read_text(encoding="utf-8").strip()
     try:
         commit_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -490,6 +432,12 @@ def _log_mlflow_artifacts(
     for artifact in (
         output_dir / "metrics.jsonl",
         output_dir / "gpu-memory.json",
+        output_dir / "metrics-schema.json",
+        output_dir / "training-plan.json",
+        output_dir / TRAIN_INPUT_MANIFEST,
+        output_dir / "checkpoint-manifest.json",
+        output_dir / "inference-smoke.json",
+        output_dir / "generation.json",
         output_dir / "model-snapshot.json",
         output_dir / f"{config.get('run_id')}.best_meta.json",
     ):
@@ -516,13 +464,19 @@ def _log_mlflow_artifacts(
                     if isinstance(value, (int, float)):
                         client.log_metric(run_id, metric, float(value), step=final_step)
     for feature_split, feature_path in (
-        ("train", config["data"]["hidden_states_path"]),
         ("eval", config["data"]["eval_hidden_states_path"]),
     ):
         feature_root = resolve_path(feature_path)
         memory_record = feature_root / "feature-extraction-memory.json"
         if memory_record.exists():
-            client.log_artifact(run_id, str(memory_record), artifact_path="metrics")
+            client.log_artifact(
+                run_id, str(memory_record), artifact_path=f"metrics/{feature_split}"
+            )
+            manifest = feature_root / "feature-manifest.json"
+            if manifest.exists():
+                client.log_artifact(
+                    run_id, str(manifest), artifact_path=f"metrics/{feature_split}"
+                )
             try:
                 capture_memory = json.loads(memory_record.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -564,17 +518,17 @@ def _feature_command(
     draft_config_path: Path,
     evaluation_config_path: Path,
     sample_limit: int | None = None,
+    output_override: Path | None = None,
 ) -> list[str]:
+    if split not in ("eval", "test"):
+        raise ValueError("Only validation and test hidden states can be captured")
     dataset = read_dataset_config(config_path)
     model_cfg = expand_env(
         yaml.safe_load(model_config_path.read_text(encoding="utf-8"))["model"]
     )
-    is_train = split == "train"
-    source = resolve_path(dataset["train_data_path" if is_train else "eval_data_path"])
-    output = resolve_path(
-        dataset["train_features_path" if is_train else "eval_features_path"]
-    )
-    samples = dataset["train_samples" if is_train else "eval_samples"]
+    source = resolve_path(dataset[f"{split}_data_path"])
+    output = output_override or resolve_path(dataset[f"{split}_features_path"])
+    samples = dataset[f"{split}_samples"]
     if not source.is_file():
         raise FileNotFoundError(
             f"prepared {split} dataset does not exist: {source}; run prepare-data first"
@@ -610,6 +564,8 @@ def _feature_command(
         dataset["chat_template"],
         "--max-length",
         str(dataset["max_length"]),
+        "--capture-seed",
+        str(dataset["seed"]),
         "--batch-size",
         str(dataset.get("preprocessing_batch_size", 1)),
         "--build-dataset-num-proc",
@@ -634,61 +590,267 @@ def _feature_command(
     return command
 
 
-def _run_inference(
-    config: dict[str, object],
-    output_config: Path,
-    evaluation_config_path: Path,
-    tokenizer_path: str,
-) -> None:
-    output_dir = resolve_path(str(config["output_dir"]))
-    run_id = str(config["run_id"])
-    checkpoint_root = output_dir
-    best = checkpoint_root / f"{run_id}-best"
-    latest = checkpoint_root / f"{run_id}-latest"
-    checkpoint = best if best.exists() else latest
-    if not checkpoint.exists():
-        raise FileNotFoundError(
-            f"no SpecForge best/latest checkpoint found under {checkpoint_root}"
-        )
-    draft_dir = output_dir / "draft_sglang"
-    _run(
-        [
-            "specforge",
-            "export",
-            "--to",
-            "sglang",
-            "--checkpoint",
-            str(checkpoint),
-            "--draft-config",
-            config["model"]["draft_model_config"],
-            "--output-dir",
-            str(draft_dir),
-            "--vocab-mapping",
-            config["model"]["vocab_mapping_path"],
-        ]
-    )
-    with evaluation_config_path.open(encoding="utf-8") as stream:
-        evaluation = yaml.safe_load(stream)["evaluation"]
-    target_path = config["model"]["target_model_path"]
-    _run(
-        [
+def _selection(dataset: dict, split: str, limit: int | None) -> int | None:
+    configured = dataset[f"{split}_samples"]
+    return min(limit, configured or limit) if limit is not None else configured
+
+
+def _data_artifacts(dataset: dict, split: str) -> tuple[Path, Path]:
+    source = resolve_path(dataset[f"{split}_data_path"])
+    return source, source.with_suffix(source.suffix + ".manifest.json")
+
+
+def _bootstrap_data(args, dataset_path: Path, dataset: dict, splits) -> None:
+    for split in splits:
+        if split != "train" and "test_data_path" in dataset:
+            ensure_dvc_artifacts_available(*_data_artifacts(dataset, "train"))
+        paths = _data_artifacts(dataset, split)
+        if all(path.with_name(f"{path.name}.dvc").exists() for path in paths):
+            ensure_dvc_artifacts_available(*paths)
+        command = [
             sys.executable,
             "-m",
-            "eagle3_olmo2.inference",
-            "--target-model",
-            target_path,
-            "--tokenizer-path",
-            tokenizer_path,
-            "--draft-model",
-            str(draft_dir),
-            "--output",
-            str(output_dir / "inference-smoke.json"),
-            "--port",
-            str(evaluation["inference_port"]),
-            "--max-new-tokens",
-            str(evaluation["inference_max_new_tokens"]),
+            "eagle3_olmo2.data",
+            "--config",
+            str(dataset_path),
+            "--split",
+            split,
         ]
+        if args.limit is not None:
+            command.extend(("--limit", str(args.limit)))
+        _run(command)
+        for artifact in paths:
+            if not artifact.with_name(f"{artifact.name}.dvc").exists():
+                register_artifact(artifact)
+        ensure_dvc_artifacts_available(*paths)
+
+
+def _prepared_data(dataset, split, limit, *, allow_existing_limit=False):
+    source, source_manifest = _data_artifacts(dataset, split)
+    ensure_dvc_artifacts_available(source, source_manifest)
+    data_metadata = json.loads(source_manifest.read_text(encoding="utf-8"))
+    if data_metadata["sha256"] != sha256_file(source):
+        raise ValueError(f"Prepared data does not match its manifest: {source}")
+    if (
+        data_metadata["dataset"] != dataset["name"]
+        or data_metadata["requested_revision"] != dataset["revision"]
+        or data_metadata["seed"] != dataset["seed"]
+        or data_metadata["parquet_pattern"] != dataset.get("parquet_pattern")
+        or data_metadata["split"]
+        != dataset.get(f"{split}_split", dataset["eval_split"])
+        or data_metadata["partition"]
+        != (split if split != "train" and "test_data_path" in dataset else None)
+        or (
+            not allow_existing_limit
+            and data_metadata["requested_samples"] != _selection(dataset, split, limit)
+        )
+    ):
+        raise ValueError(
+            f"Prepared data does not match the {split} selection: {source}"
+        )
+    return source, {
+        "source_sha256": data_metadata["sha256"],
+        "source_manifest_sha256": sha256_file(source_manifest),
+        "source_revision": data_metadata["resolved_revision"],
+    }
+
+
+def _capture(args, dataset_path, dataset, split, assets, identity) -> None:
+    source, data_identity = _prepared_data(dataset, split, args.limit)
+    output = resolve_path(dataset[f"{split}_features_path"])
+    expected = {
+        **identity,
+        "split": split,
+        **data_identity,
+        "requested_samples": args.limit,
+        "capture_sample_count": _count_jsonl_rows(source),
+        "capture_batch_size": dataset["preprocessing_batch_size"],
+        "max_eval_samples": (
+            yaml.safe_load(assets[-1].read_text(encoding="utf-8"))["evaluation"].get(
+                "max_eval_samples"
+            )
+            if split == "eval"
+            else None
+        ),
+    }
+    ref = output.with_name(f"{output.name}.dvc")
+    if ref.exists():
+        ensure_dvc_artifacts_available(output)
+        feature_manifest(output, expected)
+        return
+    if output.exists():
+        # After a failed push, reuse only a completed capture of the same inputs.
+        feature_manifest(output, expected)
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        model_config, model_path, tokenizer_path, draft_config, evaluation_path = assets
+        with tempfile.TemporaryDirectory(
+            prefix=f".{split}-", dir=output.parent
+        ) as staging:
+            working = Path(staging) / "capture"
+            _run(
+                _feature_command(
+                    split,
+                    dataset_path,
+                    model_config,
+                    model_path,
+                    tokenizer_path,
+                    draft_config,
+                    evaluation_path,
+                    args.limit,
+                    output_override=working,
+                )
+            )
+            statistics = json.loads(
+                (working / "capture-audit.json").read_text(encoding="utf-8")
+            )
+            write_json(working / "feature-manifest.json", {**statistics, **expected})
+            working.rename(output)
+    register_artifact(output)
+    ensure_dvc_artifacts_available(output)
+
+
+def _checkpoint_path(config: dict, selected: Path | None) -> Path:
+    if selected is not None:
+        return resolve_path(selected)
+    output_dir = resolve_path(config["output_dir"])
+    for kind in ("best", "latest"):
+        alias = output_dir / f"{config['run_id']}-{kind}"
+        if alias.is_symlink() or alias.exists():
+            return alias.resolve()
+    raise FileNotFoundError(
+        f"No SpecForge checkpoint alias in {output_dir}; supply --checkpoint"
     )
+
+
+def _run_inference(
+    config, evaluation_path, tokenizer_path, checkpoint, destination, args
+):
+    evaluation = yaml.safe_load(evaluation_path.read_text(encoding="utf-8"))[
+        "evaluation"
+    ]
+    destination.mkdir(parents=True, exist_ok=True)
+    draft_dir = destination / "draft_sglang"
+    if args.mode != "target-only":
+        _run(
+            [
+                "specforge",
+                "export",
+                "--to",
+                "sglang",
+                "--checkpoint",
+                str(checkpoint),
+                "--draft-config",
+                config["model"]["draft_model_config"],
+                "--output-dir",
+                str(draft_dir),
+                "--vocab-mapping",
+                str(checkpoint / "eagle3-vocab-mapping.pt"),
+            ]
+        )
+    command = [
+        sys.executable,
+        "-m",
+        "eagle3_olmo2.inference",
+        "--target-model",
+        config["model"]["target_model_path"],
+        "--tokenizer-path",
+        tokenizer_path,
+        "--mode",
+        args.mode,
+        "--output",
+        str(
+            destination
+            / (
+                "generation.json"
+                if args.suite or args.prompt
+                else "inference-smoke.json"
+            )
+        ),
+        "--port",
+        str(evaluation["inference_port"]),
+        "--max-new-tokens",
+        str(evaluation["inference_max_new_tokens"]),
+        "--settings",
+        str(evaluation_path),
+    ]
+    if args.mode != "target-only":
+        command.extend(
+            ("--draft-model", str(draft_dir), "--checkpoint", str(checkpoint))
+        )
+    if args.suite:
+        command.extend(("--suite", str(args.suite.resolve())))
+    if args.prompt:
+        command.extend(("--prompt", args.prompt))
+    if args.trace:
+        command.append("--trace")
+    _run(command)
+
+
+def _checkpoint_step(checkpoint: Path) -> int:
+    step = re.search(r"-step(\d+)$", checkpoint.name)
+    if step is None:
+        raise ValueError(
+            f"Expected the original SpecForge step directory name: {checkpoint}"
+        )
+    return int(step[1])
+
+
+def _register_checkpoint(
+    checkpoint: Path, config: dict, identity: dict, train_input: Path
+) -> None:
+    import torch
+
+    from specforge.training.checkpoint import STATE_FILE
+
+    if (
+        not (checkpoint / STATE_FILE).is_file()
+        or not (checkpoint / "training_state_rank0.pt").is_file()
+    ):
+        raise ValueError(
+            f"Expected a complete SpecForge checkpoint directory: {checkpoint}"
+        )
+    mapping = resolve_path(config["model"]["vocab_mapping_path"])
+    destination = checkpoint / "eagle3-vocab-mapping.pt"
+    manifest_path = checkpoint / "eagle3-manifest.json"
+    input_digest = sha256_file(train_input)
+    native = torch.load(
+        checkpoint / STATE_FILE, map_location="cpu", weights_only=True, mmap=True
+    )
+    if native.get(TRAIN_INPUT_DIGEST) != input_digest:
+        raise ValueError(f"Checkpoint requires different training inputs: {checkpoint}")
+    manifest = {
+        **identity,
+        "optimizer_step": _checkpoint_step(checkpoint),
+        "vocab_mapping_sha256": sha256_file(mapping),
+        TRAIN_INPUT_DIGEST: input_digest,
+    }
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+            raise ValueError(f"Checkpoint provenance differs: {checkpoint}")
+    elif not destination.exists():
+        shutil.copyfile(mapping, destination)
+    if sha256_file(destination) != manifest["vocab_mapping_sha256"]:
+        raise ValueError(f"Checkpoint vocabulary mapping differs: {checkpoint}")
+    write_json(manifest_path, manifest)
+    register_artifact(checkpoint)
+    ensure_dvc_artifacts_available(checkpoint)
+
+
+def _verify_checkpoint(checkpoint: Path, identity: dict) -> dict:
+    ensure_dvc_artifacts_available(checkpoint)
+    manifest = json.loads(
+        (checkpoint / "eagle3-manifest.json").read_text(encoding="utf-8")
+    )
+    if any(manifest.get(key) != value for key, value in identity.items()):
+        raise ValueError(
+            f"Checkpoint is incompatible with the selected target/tokenizer: {checkpoint}"
+        )
+    if manifest["vocab_mapping_sha256"] != sha256_file(
+        checkpoint / "eagle3-vocab-mapping.pt"
+    ):
+        raise ValueError(f"Checkpoint vocabulary mapping is corrupt: {checkpoint}")
+    return manifest
 
 
 def main() -> None:
@@ -699,151 +861,329 @@ def main() -> None:
             "prepare-data",
             "prepare-features",
             "compose",
+            "preflight",
             "train",
+            "register-checkpoint",
+            "validate",
             "inference",
             "full",
         ),
     )
-    parser.add_argument("--split", choices=("train", "eval", "all"), default="all")
     parser.add_argument(
-        "--limit",
-        type=int,
-        help="Use a deterministic small data subset for a smoke run",
+        "--split", choices=("train", "eval", "test", "all"), default="all"
+    )
+    parser.add_argument(
+        "--limit", type=int, help="Upper bound on prepared and captured rows"
     )
     parser.add_argument("--experiment", type=Path, default=DEFAULT_EXPERIMENT)
     parser.add_argument("--dataset-config", type=Path)
-    parser.add_argument(
-        "--output-config",
-        type=Path,
-        default=resolve_path(
-            Path(os.getenv("EAGLE3_OUTPUT_DIR", "outputs/olmo2_1b_eagle3")) / "run.yaml"
-        ),
-    )
+    parser.add_argument("--output-config", type=Path)
     parser.add_argument("--cuda-visible-devices")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--mode", choices=("target-only", "speculative", "compare"))
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--suite", type=Path)
+    inputs.add_argument("--prompt")
+    parser.add_argument("--trace", action="store_true")
+    parser.add_argument(
+        "--approved-pilot",
+        type=Path,
+        help="Completed pilot report directory after budget review",
+    )
     args = parser.parse_args()
+    args.mode = args.mode or (
+        "compare" if args.command == "validate" else "speculative"
+    )
+    if args.command == "validate" and not (args.suite or args.prompt):
+        suite_name = "final.jsonl" if args.split == "test" else "quick.jsonl"
+        args.suite = ROOT / "configs/prompts" / suite_name
     ensure_configured_storage_dirs()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
-    with args.experiment.open(encoding="utf-8") as stream:
-        infrastructure = expand_env(yaml.safe_load(stream).get("infrastructure", {}))
+    experiment = yaml.safe_load(args.experiment.read_text(encoding="utf-8"))
+    infrastructure = expand_env(experiment.get("infrastructure", {}))
+    profile = infrastructure.get("profile", "baseline")
     _configure_tracking_environment(infrastructure)
-    configured_device = infrastructure.get("device", "cuda:0")
-    if args.cuda_visible_devices:
-        visible_devices = args.cuda_visible_devices
-    elif configured_device.startswith("cuda:"):
-        visible_devices = configured_device.split(":", 1)[1]
-    elif configured_device == "cuda":
-        visible_devices = "0"
-    else:
-        parser.error("the feature-capture pipeline requires a CUDA device (cuda:N)")
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
-    if args.command in ("prepare-features", "train", "inference", "full"):
+    output_dir = experiment_output_dir(args.experiment)
+    dataset_path = args.dataset_config or experiment_module_path(
+        args.experiment, "dataset"
+    )
+    dataset = read_dataset_config(dataset_path)
+    if args.split == "test" and "test_data_path" not in dataset:
+        parser.error("This dataset configuration has no final test split")
+    splits = (
+        ("train", "eval", "test") if "test_data_path" in dataset else ("train", "eval")
+    )
+    requested = splits if args.split == "all" else (args.split,)
+    if args.command == "prepare-features":
+        if args.split == "train":
+            parser.error("Train features are computed per batch; use prepare-data")
+        requested = tuple(split for split in requested if split != "train")
+    if profile == "full" and args.limit is not None:
+        parser.error("The full profile uses the configured complete train split")
+    if args.command == "prepare-data":
+        _bootstrap_data(args, dataset_path, dataset, requested)
+        return
+
+    config = compose(args.experiment, dataset_config_path=dataset_path)
+    validate_specforge(config)
+    if config["training"]["strategy"] != "eagle3" or config["training"].get(
+        "lk_loss_type"
+    ):
+        parser.error("The project metric schema requires EAGLE-3 with LK disabled")
+    if args.command == "compose":
+        output_config = args.output_config or output_dir / "composed.yaml"
+        output_config.parent.mkdir(parents=True, exist_ok=True)
+        output_config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        print(f"Wrote SpecForge run config to {output_config}")
+        return
+
+    unbounded_train = (
+        dataset["train_samples"] is None and config["training"].get("max_steps") is None
+    )
+    full_profile = profile == "full" or unbounded_train
+    pilot_dir = None
+    starts_full = args.command in ("train", "full")
+    if full_profile and starts_full:
+        if not args.approved_pilot:
+            parser.error(
+                "Review the pilot resource budget, then supply --approved-pilot"
+            )
+        pilot = json.loads(
+            (args.approved_pilot / "training-status.json").read_text(encoding="utf-8")
+        )
+        if pilot.get("profile") != "pilot" or pilot.get("status") != "complete":
+            parser.error("--approved-pilot must point to a completed pilot report")
+        if not (args.approved_pilot / "inference-smoke.json").is_file():
+            parser.error("An approved pilot must include a generation smoke response")
+        if not (args.approved_pilot / TRAIN_INPUT_MANIFEST).is_file():
+            parser.error(
+                "The approved pilot must have trained with live OLMo-2 capture"
+            )
+        pilot_dir = args.approved_pilot.resolve()
+        if (
+            config["training"].get("max_steps") is not None
+            or dataset["train_samples"] is not None
+        ):
+            parser.error(
+                "The full profile must leave train rows and optimizer steps uncapped"
+            )
+
+    if args.command not in ("preflight", "register-checkpoint"):
+        configured_device = infrastructure.get("device", "cuda:0")
+        if configured_device != "cuda" and not configured_device.startswith("cuda:"):
+            parser.error("This pipeline requires a CUDA device")
+        visible = (
+            args.cuda_visible_devices or configured_device.partition(":")[2] or "0"
+        )
+        if "," in visible:
+            parser.error("Select exactly one visible CUDA device")
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible
         try:
             require_cuda()
         except RuntimeError as exc:
             parser.error(str(exc))
-        ensure_dvc_artifacts_available(ROOT)
 
-    if args.command in ("prepare-data", "full"):
-        dataset_config_path = args.dataset_config or experiment_module_path(
-            args.experiment, "dataset"
+    model_config = experiment_module_path(args.experiment, "model")
+    evaluation_path = experiment_module_path(args.experiment, "evaluation")
+    model_options = yaml.safe_load(model_config.read_text(encoding="utf-8"))["model"]
+    draft_config = Path(config["model"]["draft_model_config"])
+    model_path, tokenizer_path = resolve_model_assets(
+        model_config, output_dir, cache_dir=resolve_path(dataset["cache_dir"])
+    )
+    identity = {
+        **asset_identity(model_path, tokenizer_path, draft_config),
+        "target_revision": model_options["revision"],
+        "tokenizer_revision": model_options.get(
+            "tokenizer_revision", model_options["revision"]
+        ),
+        "aux_layers": config["model"]["aux_hidden_state_layer_ids"],
+    }
+    if full_profile and any(
+        not re.fullmatch(r"[0-9a-f]{40}", revision)
+        for revision in (
+            dataset["revision"],
+            identity["target_revision"],
+            identity["tokenizer_revision"],
         )
-        data_command = [
-            sys.executable,
-            "-m",
-            "eagle3_olmo2.data",
-            "--config",
-            str(dataset_config_path),
-        ]
-        if args.command == "prepare-data":
-            data_command.extend(("--split", args.split))
-        if args.limit is not None:
-            data_command.extend(("--limit", str(args.limit)))
-        _run(data_command)
-    if args.command == "prepare-features":
-        model_config_path = experiment_module_path(args.experiment, "model")
-        dataset_config_path = args.dataset_config or experiment_module_path(
-            args.experiment, "dataset"
+    ):
+        parser.error(
+            "Full training requires immutable dataset, target and tokenizer revisions"
         )
-        evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
-        with model_config_path.open(encoding="utf-8") as stream:
-            model_options = yaml.safe_load(stream)["model"]
-        model_path, tokenizer_path = resolve_model_assets(
-            model_config_path, experiment_output_dir(args.experiment)
-        )
-        draft_config_path = (
-            model_config_path.parent / model_options["draft_model_config"]
-        ).resolve()
-        for split in ("train", "eval") if args.split == "all" else (args.split,):
-            _run(
-                _feature_command(
-                    split,
-                    dataset_config_path,
-                    model_config_path,
-                    model_path,
-                    tokenizer_path,
-                    draft_config_path,
-                    evaluation_config_path,
-                    args.limit,
-                )
-            )
-        return
+    if identity["aux_layers"] != [1, 7, 12]:
+        parser.error("OLMo-2 capture expects zero-based auxiliary layers [1, 7, 12]")
+    config["model"]["target_model_path"] = model_path
+    feature_identity = {
+        **identity,
+        "max_length": dataset["max_length"],
+        "chat_template": dataset["chat_template"],
+        "dataset": dataset["name"],
+        "dataset_revision": dataset["revision"],
+        "dataset_seed": dataset["seed"],
+    }
+    assets = model_config, model_path, tokenizer_path, draft_config, evaluation_path
     if args.command == "full":
-        model_config_path = experiment_module_path(args.experiment, "model")
-        dataset_config_path = args.dataset_config or experiment_module_path(
-            args.experiment, "dataset"
-        )
-        evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
-        with model_config_path.open(encoding="utf-8") as stream:
-            model_options = yaml.safe_load(stream)["model"]
-        model_path, tokenizer_path = resolve_model_assets(
-            model_config_path, experiment_output_dir(args.experiment)
-        )
-        draft_config_path = (
-            model_config_path.parent / model_options["draft_model_config"]
-        ).resolve()
-        for split in ("train", "eval"):
-            _run(
-                _feature_command(
-                    split,
-                    dataset_config_path,
-                    model_config_path,
-                    model_path,
-                    tokenizer_path,
-                    draft_config_path,
-                    evaluation_config_path,
-                    args.limit,
-                )
+        _bootstrap_data(args, dataset_path, dataset, ("train", "eval"))
+    if args.command in ("prepare-features", "full"):
+        capture_splits = requested if args.command == "prepare-features" else ("eval",)
+        if pilot_dir:
+            for split in capture_splits:
+                ensure_dvc_artifacts_available(*_data_artifacts(dataset, split))
+            estimate_capture_storage(pilot_dir, dataset, capture_splits)
+        for split in capture_splits:
+            _capture(args, dataset_path, dataset, split, assets, feature_identity)
+        if args.command == "prepare-features":
+            return
+
+    if args.command in ("validate", "inference"):
+        checkpoint = None
+        if args.mode != "target-only" or args.command == "validate":
+            checkpoint = _checkpoint_path(config, args.checkpoint)
+            _verify_checkpoint(checkpoint, identity)
+        destination = Path(tempfile.mkdtemp(prefix=f"{args.command}-", dir=output_dir))
+        if args.command == "validate":
+            split = "test" if args.split == "test" else "eval"
+            features = resolve_path(dataset[f"{split}_features_path"])
+            ensure_dvc_artifacts_available(features)
+            feature_manifest(features, {**feature_identity, "split": split})
+            config["data"]["eval_hidden_states_path"] = str(features)
+            config["model"]["vocab_mapping_path"] = str(
+                checkpoint / "eagle3-vocab-mapping.pt"
             )
-    if args.command in ("compose", "train", "inference", "full"):
-        model_config_path = experiment_module_path(args.experiment, "model")
-        evaluation_config_path = experiment_module_path(args.experiment, "evaluation")
-        model_path, tokenizer_path = resolve_model_assets(
-            model_config_path, experiment_output_dir(args.experiment)
+            eval_config = destination / "evaluation-run.yaml"
+            eval_config.write_text(
+                yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+            )
+            _run(
+                [
+                    sys.executable,
+                    "-m",
+                    "eagle3_olmo2.evaluate",
+                    str(eval_config),
+                    str(checkpoint),
+                    str(destination / "offline-eval.json"),
+                ]
+            )
+        _run_inference(
+            config, evaluation_path, tokenizer_path, checkpoint, destination, args
         )
-        config = compose(args.experiment, target_model_path=model_path)
-        if args.command in ("train", "inference", "full"):
-            align_final_evaluation(config)
-        validate_specforge(config)
-        args.output_config.parent.mkdir(parents=True, exist_ok=True)
-        args.output_config.write_text(
+        return
+
+    source, data_identity = _prepared_data(
+        dataset,
+        "train",
+        args.limit,
+        allow_existing_limit=(
+            not full_profile and dataset["train_samples"] is None and args.limit is None
+        ),
+    )
+    config["data"]["train_data_path"] = str(source)
+    train_input = prepare_training_inputs(
+        config, source, tokenizer_path, {**feature_identity, **data_identity}
+    )
+    if args.command == "register-checkpoint":
+        _register_checkpoint(
+            _checkpoint_path(config, args.checkpoint), config, identity, train_input
+        )
+        return
+
+    evaluation = resolve_path(dataset["eval_features_path"])
+    config["data"]["eval_hidden_states_path"] = str(evaluation)
+    ensure_dvc_artifacts_available(evaluation)
+    feature_manifest(evaluation, {**feature_identity, "split": "eval"})
+    resume = config["training"].get("resume_from")
+    start_step = 0
+    if resume:
+        resume_path = resolve_path(resume)
+        recorded = _verify_checkpoint(resume_path, identity)
+        if recorded.get(TRAIN_INPUT_DIGEST) != sha256_file(train_input):
+            raise ValueError(
+                "Resume requires a live-capture checkpoint with the original training inputs"
+            )
+        if sha256_file(resume_path / "eagle3-vocab-mapping.pt") != sha256_file(
+            resolve_path(config["model"]["vocab_mapping_path"])
+        ):
+            raise ValueError("Resume requires the original training vocabulary mapping")
+        config["training"]["resume_from"] = str(resume_path)
+        start_step = _checkpoint_step(resume_path)
+    if args.command == "preflight":
+        plan = plan_training(config, output_dir, train_input, args.approved_pilot)
+        print(json.dumps(plan, indent=2))
+        return
+
+    if (output_dir / "training-status.json").exists():
+        raise RuntimeError(
+            "This output directory already has a training attempt; choose a fresh "
+            "output directory and pass the original checkpoint for resume."
+        )
+    report_dir = output_dir
+    output_config = args.output_config or report_dir / "run.yaml"
+    status = {"profile": profile, "run_id": config["run_id"]}
+    status_path = report_dir / "training-status.json"
+    started = time.monotonic()
+    # Exclusive creation prevents concurrent trainers from sharing aliases.
+    with status_path.open("x", encoding="utf-8") as stream:
+        json.dump({**status, "status": "running"}, stream)
+    try:
+        plan = plan_training(config, report_dir, train_input, pilot_dir)
+        if start_step >= plan["optimizer_steps"]:
+            raise ValueError(
+                "The resume checkpoint has already reached the configured horizon"
+            )
+        output_config.parent.mkdir(parents=True, exist_ok=True)
+        output_config.write_text(
             yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
         )
-        print(f"Wrote SpecForge run config to {args.output_config}")
-        if args.command in ("train", "full"):
-            _record_training(
-                ["specforge", "train", "--config", str(args.output_config)],
-                config,
-                args.output_config,
+        _record_training(
+            [sys.executable, "-m", "eagle3_olmo2.train", str(output_config)],
+            config,
+            report_dir,
+        )
+        training_wall_seconds = time.monotonic() - started
+        checkpoint = _checkpoint_path(config, None)
+        latest = (output_dir / f"{config['run_id']}-latest").resolve(strict=True)
+        final_step = _checkpoint_step(latest)
+        if final_step != plan["optimizer_steps"]:
+            raise RuntimeError(
+                f"Final checkpoint step {final_step} differs from the training plan"
             )
-        if args.command == "inference":
+        write_json(
+            report_dir / "checkpoint-manifest.json",
+            {
+                **identity,
+                "best": str(checkpoint),
+                "latest": str(latest),
+                "planned_optimizer_steps": plan["optimizer_steps"],
+                "resumed_from": config["training"].get("resume_from"),
+            },
+        )
+        for complete in dict.fromkeys((checkpoint, latest)):
+            _register_checkpoint(complete, config, identity, train_input)
+        if args.command == "full":
             _run_inference(
-                config, args.output_config, evaluation_config_path, tokenizer_path
+                config, evaluation_path, tokenizer_path, checkpoint, report_dir, args
             )
-        elif args.command == "full":
-            _run_inference(
-                config, args.output_config, evaluation_config_path, tokenizer_path
-            )
+        if config["tracking"]["report_to"] == "mlflow":
+            _log_mlflow_artifacts(config, report_dir, output_config)
+    except BaseException as exc:
+        write_json(
+            status_path,
+            {**status, "status": "failed", "error_type": type(exc).__name__},
+        )
+        raise
+    write_json(
+        status_path,
+        {
+            **status,
+            "status": "complete",
+            "training_wall_seconds": training_wall_seconds,
+            "optimizer_steps_executed": final_step - start_step,
+            "checkpoint": str(checkpoint),
+            "latest": str(latest),
+        },
+    )
 
 
 if __name__ == "__main__":

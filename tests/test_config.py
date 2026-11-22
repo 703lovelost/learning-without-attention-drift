@@ -9,13 +9,11 @@ from unittest.mock import patch
 
 from eagle3_olmo2.cli import (
     _configure_tracking_environment,
-    _discard_future_best,
     _feature_command,
     _log_mlflow_artifacts,
     _target_head_compatible_snapshot,
     _write_metric_plots,
     _write_svg,
-    align_final_evaluation,
     require_cuda,
     resolve_model_assets,
 )
@@ -37,7 +35,8 @@ class ConfigCompositionTest(unittest.TestCase):
                 config = compose(DEFAULT_EXPERIMENT)
 
         self.assertEqual(
-            config["data"]["hidden_states_path"], str(storage / "data/features/train")
+            config["data"]["train_data_path"],
+            str(storage / "data/ultrachat/train_sft.jsonl"),
         )
         self.assertEqual(
             config["data"]["eval_hidden_states_path"],
@@ -45,10 +44,8 @@ class ConfigCompositionTest(unittest.TestCase):
         )
         self.assertEqual(config["model"]["cache_dir"], str(storage / "cache"))
         self.assertEqual(config["output_dir"], str(storage / "outputs"))
-        self.assertEqual(
-            config["model"]["vocab_mapping_path"],
-            str(storage / "data/features/train/vocab_mapping/vocab_mapping.pt"),
-        )
+        self.assertEqual(config["model"]["vocab_mapping_path"], "")
+        self.assertNotIn("hidden_states_path", config["data"])
 
     def test_experiment_tracking_uri_is_passed_to_child_environment(self):
         tracking_uri = "sqlite:////tmp/eagle3-test-mlflow.db"
@@ -71,17 +68,19 @@ class ConfigCompositionTest(unittest.TestCase):
         self.assertIsNone(config["tracking"]["mlflow_tracking_uri"])
         self.assertNotIn("private-token", repr(config))
 
-    def test_compose_produces_offline_eagle3_config(self):
+    def test_compose_produces_live_eagle3_config(self):
         config = compose(DEFAULT_EXPERIMENT, target_model_path="/models/olmo2")
         self.assertEqual(config["model"]["target_model_path"], "/models/olmo2")
         self.assertEqual(config["training"]["strategy"], "eagle3")
         self.assertNotIn("optimizer", config["training"])
         self.assertEqual(config["training"]["lr_scheduler"], "cosine")
-        self.assertEqual(config["data"]["hidden_states_path"], "data/features/train")
+        self.assertEqual(
+            config["data"]["train_data_path"], "data/ultrachat/train_sft.jsonl"
+        )
         self.assertEqual(
             config["data"]["eval_hidden_states_path"], "data/features/eval"
         )
-        self.assertEqual(config["training"]["ttt_length"], 7)
+        self.assertEqual(config["training"]["ttt_length"], 8)
         expected_tracker = "mlflow" if os.getenv("MLFLOW_TRACKING_URI") else "none"
         self.assertEqual(config["tracking"]["report_to"], expected_tracker)
         self.assertIsNone(config["tracking"]["mlflow_tracking_uri"])
@@ -99,7 +98,7 @@ class ConfigCompositionTest(unittest.TestCase):
             _write_metric_plots(
                 {
                     "train/loss": [(1, 2.0), (2, 1.0)],
-                    "eval/avg_loss": [(1, 1.5), (2, 0.8)],
+                    "eval/loss": [(1, 1.5), (2, 0.8)],
                     "eval/simulated_acc_len": [(1, 1.1), (2, 1.4)],
                     "eval/acceptance_rate_1": [(1, 0.5), (2, 0.7)],
                 },
@@ -125,36 +124,12 @@ class ConfigCompositionTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "NVIDIA driver"):
                 require_cuda()
 
-    def test_resume_from_older_checkpoint_drops_future_best_alias(self):
-        with TemporaryDirectory() as directory:
-            output = Path(directory)
-            checkpoint = output / "run-step4"
-            checkpoint.mkdir()
-            (output / "run-best").symlink_to(checkpoint.name)
-            metadata = output / "run.best_meta.json"
-            metadata.write_text(json.dumps({"step": 4, "score": 2.0}))
-
-            self.assertTrue(_discard_future_best(output, "run", resume_step=2))
-            self.assertFalse(metadata.exists())
-            self.assertFalse((output / "run-best").exists())
-            self.assertTrue(checkpoint.exists())
-
-            metadata.write_text(json.dumps({"step": 1, "score": 1.0}))
-            self.assertFalse(_discard_future_best(output, "run", resume_step=2))
-            self.assertTrue(metadata.exists())
-
     def test_mlflow_artifact_upload_logs_vram_as_metrics(self):
         calls = {"metrics": [], "artifacts": [], "params": []}
 
         class FakeClient:
             def __init__(self, tracking_uri=None):
                 pass
-
-            def get_experiment_by_name(self, name):
-                return types.SimpleNamespace(experiment_id="exp")
-
-            def search_runs(self, experiment_ids, **kwargs):
-                return [types.SimpleNamespace(info=types.SimpleNamespace(run_id="run"))]
 
             def log_artifact(self, run_id, path, artifact_path=None):
                 calls["artifacts"].append((path, artifact_path))
@@ -168,10 +143,8 @@ class ConfigCompositionTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
-            train_features = root / "features/train"
             eval_features = root / "features/eval"
             output.mkdir()
-            train_features.mkdir(parents=True)
             eval_features.mkdir(parents=True)
             (output / "metrics.jsonl").write_text('{"step": 7, "loss": 1.0}\n')
             (output / "gpu-memory.json").write_text(
@@ -183,15 +156,11 @@ class ConfigCompositionTest(unittest.TestCase):
                     }
                 )
             )
-            for features in (train_features, eval_features):
-                (features / "feature-extraction-memory.json").write_text(
-                    json.dumps(
-                        {
-                            "peak_allocated_bytes": 1048576,
-                            "peak_reserved_bytes": 2097152,
-                        }
-                    )
+            (eval_features / "feature-extraction-memory.json").write_text(
+                json.dumps(
+                    {"peak_allocated_bytes": 1048576, "peak_reserved_bytes": 2097152}
                 )
+            )
             config_path = root / "run.yaml"
             config_path.write_text("model: {}\ntraining: {}\n")
             config = {
@@ -201,7 +170,6 @@ class ConfigCompositionTest(unittest.TestCase):
                     "mlflow_experiment_name": "e",
                 },
                 "data": {
-                    "hidden_states_path": str(train_features),
                     "eval_hidden_states_path": str(eval_features),
                 },
                 "model": {},
@@ -210,31 +178,19 @@ class ConfigCompositionTest(unittest.TestCase):
             fake_mlflow = types.ModuleType("mlflow")
             fake_mlflow.MlflowClient = FakeClient
             with patch.dict(sys.modules, {"mlflow": fake_mlflow}):
+                (output / "mlflow-run-id").write_text("run")
                 _log_mlflow_artifacts(config, output, config_path)
 
         logged = {name: (value, step) for name, value, step in calls["metrics"]}
         self.assertEqual(logged["gpu/peak_used_mib"], (5000.0, 7))
         self.assertEqual(logged["gpu/training_peak_used_mib"], (4500.0, 7))
         self.assertEqual(logged["gpu/evaluation_peak_used_mib"], (4800.0, 7))
-        self.assertEqual(logged["gpu/capture_train_peak_reserved_mib"], (2.0, 7))
+        self.assertNotIn("gpu/capture_train_peak_reserved_mib", logged)
         self.assertEqual(logged["gpu/capture_eval_peak_reserved_mib"], (2.0, 7))
         self.assertIn(("training.optimizer", "adamw"), calls["params"])
         self.assertTrue(
             any(name == "project.git_commit" for name, _ in calls["params"])
         )
-
-    def test_eval_interval_lands_on_final_offline_update(self):
-        config = compose(DEFAULT_EXPERIMENT, target_model_path="/models/olmo2")
-        with TemporaryDirectory() as directory:
-            feature_dir = Path(directory) / "features"
-            feature_dir.mkdir()
-            for index in range(20):
-                (feature_dir / f"{index}.ckpt").touch()
-            config["data"]["hidden_states_path"] = str(feature_dir)
-            config["training"]["max_steps"] = 100
-            align_final_evaluation(config)
-            self.assertEqual(config["training"]["eval_interval"], 5)
-            self.assertEqual(config["training"]["log_interval"], 5)
 
     def test_local_model_and_tokenizer_paths_are_recorded(self):
         with TemporaryDirectory() as directory:
@@ -296,20 +252,16 @@ class ConfigCompositionTest(unittest.TestCase):
     def test_feature_capture_uses_single_process_torchrun(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            train_data = root / "train.jsonl"
             eval_data = root / "eval.jsonl"
-            train_data.write_text('{"conversations": []}\n' * 3, encoding="utf-8")
             eval_data.write_text('{"conversations": []}\n' * 2, encoding="utf-8")
             dataset_path = root / "dataset.yaml"
             dataset_path.write_text(
                 "dataset:\n"
-                f"  train_data_path: {train_data}\n"
                 f"  eval_data_path: {eval_data}\n"
-                "  train_features_path: features/train\n"
                 "  eval_features_path: features/eval\n"
-                "  train_samples: 8\n"
                 "  eval_samples: 4\n"
                 "  max_length: 128\n"
+                "  seed: 42\n"
                 "  preprocessing_batch_size: 1\n"
                 "  cache_dir: .cache/huggingface\n"
                 "  chat_template: olmo2\n",
@@ -328,7 +280,7 @@ class ConfigCompositionTest(unittest.TestCase):
             evaluation_path.write_text("evaluation: {}\n", encoding="utf-8")
 
             command = _feature_command(
-                "train",
+                "eval",
                 dataset_path,
                 model_config_path,
                 "/models/target",
@@ -348,7 +300,7 @@ class ConfigCompositionTest(unittest.TestCase):
             )
 
             limited_command = _feature_command(
-                "train",
+                "eval",
                 dataset_path,
                 model_config_path,
                 "/models/target",

@@ -1,0 +1,25 @@
+# @package _global_
+
+defaults:
+  - olmo2_1b
+  - _self_
+
+experiment:
+  name: olmo2-1b-eagle3-full
+
+infrastructure:
+  output_dir: ${oc.env:EAGLE3_OUTPUT_DIR,outputs/olmo2_1b_eagle3}/full
+  profile: full
+
+training:
+  # Initial quality baseline. Compare held-out checkpoints before extending it.
+  num_epochs: 1
+  max_steps: null
+  # Consume every valid capture even when their number is not divisible by 4.
+  accumulation_steps: 1
+  save_interval: 1000
+  log_interval: 100
+
+evaluation:
+  eval_interval: 1000
+  max_eval_samples: 1024

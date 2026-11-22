@@ -1,16 +1,19 @@
 dataset:
   name: HuggingFaceH4/ultrachat_200k
-  revision: main
+  revision: 8049631c405ae6576f93f445c6b8166f76f5505a
+  parquet_pattern: data/{split}-*.parquet
   train_split: train_sft
   eval_split: test_sft
   seed: 42
   train_samples: null
-  eval_samples: 128
+  eval_samples: 1024
+  test_samples: 1024
   max_length: 1024
   chat_template: olmo2
   train_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/train_sft.jsonl
-  eval_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/test_sft.jsonl
-  train_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/features/train
+  eval_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/validation.jsonl
+  test_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/ultrachat/test.jsonl
   eval_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/features/eval
+  test_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/features/test
   cache_dir: ${oc.env:EAGLE3_CACHE_DIR,.cache}
   preprocessing_batch_size: 1

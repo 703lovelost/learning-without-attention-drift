@@ -1,4 +1,4 @@
-"""Compose project YAML modules into the typed native SpecForge run config."""
+"""Compose project YAML modules for the single-GPU SpecForge trainer."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def experiment_module_path(experiment_path: Path, name: str) -> Path:
 def compose(
     experiment_path: Path,
     *,
-    features: bool = True,
+    dataset_config_path: Path | None = None,
     target_model_path: str | None = None,
 ) -> dict[str, Any]:
     experiment_path = experiment_path.resolve()
@@ -51,6 +51,8 @@ def compose(
         )
 
     module_paths = [(experiment_path.parent / path).resolve() for path in paths]
+    if dataset_config_path is not None:
+        module_paths[1] = dataset_config_path.resolve()
     modules = [_expand_env(_read_yaml(path)) for path in module_paths]
     model = modules[0]["model"]
     dataset = modules[1]["dataset"]
@@ -58,7 +60,7 @@ def compose(
     optimizer = str(training.pop("optimizer", "adamw")).lower()
     if optimizer != "adamw":
         raise ValueError(
-            "the pinned SpecForge offline EAGLE-3 trainer uses AdamW; "
+            "the pinned SpecForge EAGLE-3 trainer uses AdamW; "
             f"unsupported project optimizer={optimizer!r}"
         )
     evaluation = modules[3]["evaluation"]
@@ -66,18 +68,13 @@ def compose(
 
     model_path = target_model_path or model["target_model_path"]
     data = {
-        "hidden_states_path": dataset["train_features_path"] if features else "",
-        "eval_hidden_states_path": dataset["eval_features_path"] if features else "",
+        "train_data_path": dataset["train_data_path"],
+        "eval_hidden_states_path": dataset["eval_features_path"],
         "max_length": dataset["max_length"],
         "chat_template": dataset["chat_template"],
         "cache_dir": dataset["cache_dir"],
         "dataloader_num_workers": training.pop("dataloader_num_workers", 0),
     }
-    if not features:
-        raise ValueError(
-            "SpecForge native training requires prepared hidden-state features"
-        )
-
     train_model_config = (
         module_paths[0].parent / model["draft_model_config"]
     ).resolve()
@@ -96,15 +93,11 @@ def compose(
         "draft_model_config": str(train_model_config),
         "draft_num_hidden_layers": model["draft_num_hidden_layers"],
         "target_backend": model["target_backend"],
+        "train_target_cpu_offload": model.get("train_target_cpu_offload", True),
         "trust_remote_code": model["trust_remote_code"],
         "embedding_key": model["embedding_key"],
         "lm_head_key": model["lm_head_key"],
-        "vocab_mapping_path": str(
-            (
-                resolve_path(dataset["train_features_path"])
-                / "vocab_mapping/vocab_mapping.pt"
-            ).resolve()
-        ),
+        "vocab_mapping_path": "",
         "aux_hidden_state_layer_ids": model["aux_hidden_state_layer_ids"],
         "torch_dtype": model["torch_dtype"],
         "cache_dir": str(resolve_path(dataset["cache_dir"])),
@@ -133,16 +126,48 @@ def compose(
     return run
 
 
-def validate_specforge(config: dict[str, Any]) -> None:
-    """Validate with SpecForge's own strict pydantic schema."""
+def validate_specforge(config: dict[str, Any]):
+    """Validate the colocated runtime and its hidden-state batch contract."""
     import sys
 
     specforge_root = str(ROOT / "specforge")
     if specforge_root not in sys.path:
         sys.path.insert(0, specforge_root)
-    from specforge.config import Config
+    from specforge.config import Config, DataConfig, ModelConfig
 
-    Config.model_validate(config)
+    class LiveDataConfig(DataConfig):
+        tokenized_train_path: str | None = None
+
+    class LiveModelConfig(ModelConfig):
+        train_target_cpu_offload: bool = True
+
+    class LiveTrainConfig(Config):
+        data: LiveDataConfig
+        model: LiveModelConfig
+
+        @property
+        def mode(self) -> str:
+            # SpecForge uses this to select the colocated hidden-state contract.
+            # The project supplies the batches at runtime through the loader.
+            return "offline"
+
+    LiveTrainConfig.model_rebuild(
+        _types_namespace={
+            "LiveDataConfig": LiveDataConfig,
+            "LiveModelConfig": LiveModelConfig,
+        }
+    )
+    resolved = LiveTrainConfig.model_validate(config)
+    training = resolved.training
+    if (
+        not resolved.data.train_data_path
+        or resolved.deployment.mode != "local_colocated"
+        or (training.tp_size, training.sp_ulysses_size, training.sp_ring_size)
+        != (1, 1, 1)
+        or training.attention_backend == "usp"
+    ):
+        raise ValueError("Live EAGLE-3 requires JSONL input and a single colocated GPU")
+    return resolved
 
 
 def main() -> None:

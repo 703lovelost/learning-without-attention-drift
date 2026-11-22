@@ -10,7 +10,7 @@ outputs/*
 !outputs/*.dvc
 !outputs/.gitignore
 mlruns/
-docs/*
-!docs/implementation-status.md
-!docs/project-goals.md
+docs/
+.agents/
+AGENTS.md
 .env

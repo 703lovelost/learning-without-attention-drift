@@ -44,12 +44,16 @@ class PipelineSmokeTest(unittest.TestCase):
                     "target_model_path": os.getenv(
                         "EAGLE3_OLMO2_MODEL_ID", "allenai/OLMo-2-0425-1B-Instruct"
                     ),
-                    "revision": os.getenv("EAGLE3_OLMO2_MODEL_REVISION", "main"),
+                    "revision": os.getenv(
+                        "EAGLE3_OLMO2_MODEL_REVISION",
+                        "48d788eca847d4d7548f375ad03d3c9312f6139e",
+                    ),
                     "tokenizer_path": os.getenv(
                         "EAGLE3_OLMO2_TOKENIZER_ID", "allenai/OLMo-2-0425-1B-Instruct"
                     ),
                     "tokenizer_revision": os.getenv(
-                        "EAGLE3_OLMO2_TOKENIZER_REVISION", "main"
+                        "EAGLE3_OLMO2_TOKENIZER_REVISION",
+                        "48d788eca847d4d7548f375ad03d3c9312f6139e",
                     ),
                     "draft_architecture": "LlamaForCausalLMEagle3",
                     "draft_model_config": str(draft_config),
@@ -66,7 +70,8 @@ class PipelineSmokeTest(unittest.TestCase):
             dataset_config = {
                 "dataset": {
                     "name": "HuggingFaceH4/ultrachat_200k",
-                    "revision": "main",
+                    "revision": "8049631c405ae6576f93f445c6b8166f76f5505a",
+                    "parquet_pattern": "data/{split}-*.parquet",
                     "train_split": "train_sft",
                     "eval_split": "test_sft",
                     "seed": 42,
@@ -76,7 +81,6 @@ class PipelineSmokeTest(unittest.TestCase):
                     "chat_template": "olmo2",
                     "train_data_path": str(work / "data/train.jsonl"),
                     "eval_data_path": str(work / "data/eval.jsonl"),
-                    "train_features_path": str(work / "features/train"),
                     "eval_features_path": str(work / "features/eval"),
                     "cache_dir": str(work / "cache"),
                     "preprocessing_batch_size": 1,
@@ -153,6 +157,8 @@ class PipelineSmokeTest(unittest.TestCase):
             env = os.environ.copy()
             env["PYTHONPATH"] = f"{ROOT / 'src'}:{env.get('PYTHONPATH', '')}"
             env.pop("MLFLOW_TRACKING_URI", None)
+            env["DVC_CACHE_DIR"] = str(work / "dvc-cache")
+            env["DVC_REMOTE_DIR"] = str(work / "dvc-remote")
             cuda_devices = os.getenv("EAGLE3_CUDA_VISIBLE_DEVICES", "0")
             cli = [
                 sys.executable,
@@ -183,9 +189,9 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue((output_dir / "inference-smoke.json").exists())
             inference = json.loads((output_dir / "inference-smoke.json").read_text())
             self.assertTrue(inference["response"].get("text"))
-            self.assertTrue(
-                (work / "features/train/feature-extraction-memory.json").exists()
-            )
+            self.assertFalse((work / "features/train").exists())
+            self.assertFalse((work / "features/train.dvc").exists())
+            self.assertTrue((output_dir / "train-input-manifest.json").exists())
             self.assertTrue(
                 (work / "features/eval/feature-extraction-memory.json").exists()
             )
@@ -201,7 +207,7 @@ class PipelineSmokeTest(unittest.TestCase):
                     for key in row
                 )
             )
-            self.assertTrue(any("eval/avg_loss" in row for row in metrics))
+            self.assertTrue(any("eval/loss" in row for row in metrics))
 
             from specforge.training.checkpoint import CheckpointManager
 
@@ -218,7 +224,36 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertEqual(resume_state["global_step"], 1)
             self.assertIsNotNone(resume_state["backend"].get("optimizer"))
             self.assertIsNotNone(resume_state["backend"].get("rng"))
+            import math
 
+            import torch
+
+            self.assertTrue(
+                any(
+                    "train/grad_norm" in row and math.isfinite(row["train/grad_norm"])
+                    for row in metrics
+                )
+            )
+            self.assertTrue(
+                any(
+                    not torch.equal(weights, checkpoint_state["draft_state_dict"][name])
+                    for name, weights in resume_state["draft_state_dict"].items()
+                )
+            )
+
+            register_cli = [
+                sys.executable,
+                "-m",
+                "eagle3_olmo2.cli",
+                "register-checkpoint",
+                "--experiment",
+                str(experiment_path),
+                "--checkpoint",
+                str(resume_source),
+            ]
+            subprocess.run(register_cli, cwd=ROOT, env=env, check=True, timeout=600)
+            resume_output = work / "outputs-resume"
+            experiment["infrastructure"]["output_dir"] = str(resume_output)
             experiment["infrastructure"]["resume_from_checkpoint"] = str(resume_source)
             experiment["infrastructure"]["mlflow_tracking_uri"] = None
             experiment_path.write_text(
@@ -239,11 +274,16 @@ class PipelineSmokeTest(unittest.TestCase):
             ]
             subprocess.run(train_cli, cwd=ROOT, env=env, check=True, timeout=1800)
             resumed_state = CheckpointManager.read_resume_state(
-                str(output_dir / "olmo2-eagle3-gpu-smoke-latest")
+                str(resume_output / "olmo2-eagle3-gpu-smoke-latest")
             )
             self.assertEqual(resumed_state["global_step"], 2)
+            self.assertEqual(
+                resumed_state["backend"]["optimizer"]["scheduler_state_dict"],
+                checkpoint_state["backend"]["optimizer"]["scheduler_state_dict"],
+            )
+            self.assertIsNotNone(resumed_state["backend"].get("rng"))
             resumed_best = json.loads(
-                (output_dir / "olmo2-eagle3-gpu-smoke.best_meta.json").read_text()
+                (resume_output / "olmo2-eagle3-gpu-smoke.best_meta.json").read_text()
             )
             self.assertEqual(resumed_best["step"], 2)
 
@@ -259,7 +299,7 @@ class PipelineSmokeTest(unittest.TestCase):
                 json.loads(line)
                 for line in (local_output / "metrics.jsonl").read_text().splitlines()
             ]
-            self.assertTrue(any("loss" in row for row in local_metrics))
+            self.assertTrue(any("train/loss" in row for row in local_metrics))
 
             from mlflow import MlflowClient
 
@@ -269,10 +309,10 @@ class PipelineSmokeTest(unittest.TestCase):
             runs = client.search_runs([mlflow_experiment.experiment_id], max_results=10)
             self.assertTrue(runs)
             self.assertIn("train/loss", runs[0].data.metrics)
-            self.assertIn("eval/avg_loss", runs[0].data.metrics)
+            self.assertIn("eval/loss", runs[0].data.metrics)
             self.assertIn("eval/simulated_acc_len", runs[0].data.metrics)
             self.assertGreater(
-                runs[0].data.metrics["gpu/capture_train_peak_reserved_mib"], 0
+                runs[0].data.metrics["gpu/capture_eval_peak_reserved_mib"], 0
             )
             self.assertTrue(client.list_artifacts(runs[0].info.run_id, "plots"))
             self.assertTrue(

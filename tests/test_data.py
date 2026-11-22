@@ -112,3 +112,19 @@ class NormalizeMessagesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_prompt_groups_cover_punctuation_and_rewritten_trailing_context():
+    from eagle3_olmo2.data import prompt_id
+
+    prefix = (
+        "Please read the summary of the review carefully and identify "
+        "the name of the author listed"
+    )
+    messages = [{"role": "user", "content": f"{prefix}. The report is attached."}]
+    variant = [
+        {"role": "user", "content": f"{prefix.upper()}! Use the corrected report."}
+    ]
+    other = [{"role": "user", "content": "Identify the publication date."}]
+    assert prompt_id(messages) == prompt_id(variant)
+    assert prompt_id(messages) != prompt_id(other)

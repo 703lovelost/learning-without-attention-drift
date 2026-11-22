@@ -23,9 +23,8 @@ pipeline = [
 ]
 
 [project.scripts]
-eagle3-olmo2 = "eagle3_olmo2.cli:main"
+eagle3-olmo2 = "eagle3_olmo2.hydra_cli:main"
 eagle3-olmo2-dvc-setup = "eagle3_olmo2.dvc:main"
-eagle3-olmo2-hydra = "eagle3_olmo2.hydra_cli:main"
 
 [dependency-groups]
 dev = [

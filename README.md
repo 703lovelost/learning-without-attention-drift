@@ -1,253 +1,277 @@
-# OLMo-2 1B EAGLE-3 training with SpecForge
+# OLMo-2 1B EAGLE-3 with SpecForge
 
-This repository configures SpecForge's native offline EAGLE-3 pipeline for
-`allenai/OLMo-2-0425-1B-Instruct` and UltraChat 200k. SpecForge is pinned as a
-Git submodule. Project code downloads and normalizes data, registers the OLMo-2
-assistant-mask delimiters for feature capture, composes typed YAML modules, and
-invokes `specforge train`; it does not implement a trainer.
+Train a one-layer EAGLE-3 drafter for `allenai/OLMo-2-0425-1B-Instruct` on UltraChat
+200k. During training, the frozen OLMo-2 backbone computes activations from
+blocks 1, 7, and 12 (zero-based) and its final layer for each batch.
+SpecForge trains the drafter on assistant response tokens and saves resumable
+checkpoints. During generation, OLMo-2 verifies the drafter's proposed tokens.
 
-## Status
+UltraChat SFT → normalized conversations → token IDs and loss masks →
+live OLMo-2 batches → SpecForge checkpoint → SGLang draft export.
 
-The previous project README recorded a full pipeline smoke on one NVIDIA RTX
-3060 with driver 580.178.04, Python 3.11.17, and PyTorch 2.13.0+cu130. It
-reported 8 train and 8 evaluation examples, two optimizer steps, checkpoint
-export, SGLang inference, and peak sampled GPU memory of 9,021 MiB. This audit
-also passed the opt-in GPU smoke: 8 train and 8 evaluation examples, two
-optimizer steps, checkpoint resume, export, SGLang inference, local MLflow, and
-metric plots. The historical memory and metric values above were not asserted
-to match. Smoke-scale results do not establish full-dataset training quality.
-See [implementation
-status](docs/implementation-status.md) and [project goals](docs/project-goals.md).
+## 1. Set up the environment
 
-## Installation
-
-Use Python 3.11 or newer and `uv`. Clone with the SpecForge submodule:
+Run the commands in Bash from the repository root on Linux with Git and
+[uv](https://docs.astral.sh/uv/). Keep the SpecForge submodule at the revision pinned by
+the repository. On Talos, point `UV_PROJECT_ENVIRONMENT` to the project
+environment in `/opt/venvs` before running uv.
 
 ```bash
-# Clone the project repository with its SpecForge submodule, then enter it.
-test -f .env || cp .env.example .env
-# Edit the EAGLE3_*, HF_HOME, DVC_*, and cache paths in .env to external storage.
+git submodule update --init --recursive
+uv python install 3.11
 uv sync --locked --extra pipeline --group dev
-uv run --env-file .env pre-commit install
-```
-
-Pre-commit checks whitespace, YAML/TOML syntax, merge conflicts, large files,
-filename collisions, broken symlinks, and private keys. Pinned Black, isort,
-flake8, and Prettier hooks format and lint project files. Black runs with
-`--workers 1` directly, without a shell wrapper or a process pool. After setup,
-run `uv run --env-file .env pre-commit run --all-files` to check tracked files.
-
-The pipeline reads its paths from `.env`. `EAGLE3_DATA_DIR` holds downloaded
-datasets and captured features; `EAGLE3_OUTPUT_DIR` holds checkpoints, plots,
-configs, and inference results; `EAGLE3_CACHE_DIR` holds processed dataset and
-feature caches. `HF_HOME` holds Hugging Face downloads, `TMPDIR` holds temporary
-files, and the CUDA/Torch cache variables move compiler caches off the
-workspace. `PYTHONDONTWRITEBYTECODE=1` prevents Python from writing `.pyc`
-bytecode files. The CLI creates configured directories and rejects relative
-paths. Do not replace an existing `.env` with the example; merge the required
-path variables into it.
-
-The pipeline extra installs the pinned SpecForge submodule and its runtime
-dependencies, including PyTorch and SGLang. CUDA wheel availability depends on
-the host driver and the package index used by uv; verify the selected PyTorch
-build before starting GPU stages:
-
-```bash
-uv run --env-file .env python -c 'import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CUDA unavailable")'
-```
-
-Tracking settings can be exported in the shell or loaded explicitly with
-`uv run --env-file .env eagle3-olmo2 ...`; the application does not load `.env`
-automatically. MLflow credentials remain process environment values and are
-excluded from the resolved run configuration and tracker parameters.
-`.env.example` documents the MLflow variables. GPU stages need a CUDA-capable
-PyTorch install, the CUDA Toolkit compiler (`/usr/local/cuda/bin/nvcc` for the
-pinned SGLang JIT path), a C++ compiler, model/dataset access, and enough GPU
-memory. The CUDA version shown by `nvidia-smi` describes driver support; it
-does not confirm that `nvcc` is installed. The reported smoke used an RTX 3060
-with 12 GiB.
-
-## Data and DVC
-
-The default source is the public `HuggingFaceH4/ultrachat_200k` dataset. The
-pipeline writes its working files to the external paths configured in `.env`.
-DVC cache and remote storage are separate external directories; configure them
-in `.env` before initializing DVC:
-
-```bash
 test -f .env || cp .env.example .env
-uv run --env-file .env dvc init
-uv run --env-file .env eagle3-olmo2-dvc-setup
-uv run dvc cache dir
-uv run dvc remote list
 ```
 
-`eagle3-olmo2-dvc-setup` writes machine-specific cache/remote settings to
-`.dvc/config.local`, which must not be committed. This repository currently has
-no DVC artifact pointers. DVC cache/remote configuration does not relocate the
-pipeline's working files; their locations come from `EAGLE3_DATA_DIR` and
-`EAGLE3_OUTPUT_DIR`. Publish shared DVC artifacts only after choosing DVC
-pointer paths that match the external-storage layout.
+Use writable, absolute paths in `.env`. The [environment template](.env.example) lists
+the storage and compiler cache settings.
 
-Use a shared remote for collaboration. The local remote in `.env.example` is a
-machine-local example and does not transfer artifacts to another machine by
-itself. `prepare-features`, `train`, `inference`, and `full` run `dvc pull`
-when `.dvc` pointers or a `dvc.lock` exist; a `dvc.yaml` without a lockfile is
-not treated as cached data. Pull failures stop the command. Without DVC refs,
-the existing Hugging Face data preparation workflow continues normally.
+| Variable                             | Contents                                                                   |
+| ------------------------------------ | -------------------------------------------------------------------------- |
+| `EAGLE3_DATA_DIR`                    | Prepared JSONL, validation/test features, and their DVC refs               |
+| `EAGLE3_OUTPUT_DIR`                  | Checkpoints, metrics, configs, and evaluation reports                      |
+| `EAGLE3_CACHE_DIR` and `HF_HOME`     | Tokenized training inputs, target index, and Hugging Face downloads        |
+| `DVC_CACHE_DIR` and `DVC_REMOTE_DIR` | Separate, non-nested directories for the DVC object cache and local remote |
 
-## Configuration
+The pipeline resolves pinned dataset, model, and tokenizer revisions. The first run
+needs access to Hugging Face to populate the caches. See the
+[dataset pin](configs/datasets/ultrachat_200k.yaml) and
+[model pin](configs/models/olmo2_1b.yaml).
 
-The experiment YAML composes model, dataset, training, and evaluation modules:
-
-- `configs/models/olmo2_1b.yaml`: Hugging Face model/tokenizer revision, target
-  dtype, OLMo-2 target feature layers, and draft architecture size.
-- `configs/datasets/ultrachat_200k.yaml`: UltraChat train/evaluation splits,
-  deterministic seed, sequence length, templates, and feature paths.
-- `configs/training/eagle3_single_gpu.yaml`: one-layer pre-norm EAGLE-3,
-  microbatch, accumulation, mixed precision, AdamW optimizer, optimizer
-  offload, TTT length, loss controls, and save/evaluation cadence. The composer
-  checks the project-level optimizer selector against SpecForge's built-in
-  AdamW implementation and removes it before native schema validation.
-- `configs/evaluation/default.yaml`: validation cadence and evaluation limits.
-- `configs/experiments/olmo2_1b_baseline.yaml`: module references, output path,
-  MLflow settings, and optional resume checkpoint.
-
-The OLMo-2 instruct tokenizer renders prompts itself. The feature adapter
-registers its `<|user|>`, `<|assistant|>`, and `<|endoftext|>` boundaries with
-SpecForge for assistant-only loss masking, following the [model card](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct).
-If `tokenizer_path` is changed, feature preparation checks that its token IDs
-and chat template match the target tokenizer.
-
-The config composer resolves the configured model revision to a local Hugging
-Face snapshot. Its immutable snapshot path is written into the generated
-SpecForge YAML. Change the model and dataset `revision` fields from `main` to
-immutable commit IDs for a fully pinned reproduction.
-
-Hydra composes the existing model, dataset, training, and evaluation modules.
-Use the `eagle3-olmo2-hydra` entry point for dotted overrides, for example:
+Feature capture, training, validation, and inference use one NVIDIA GPU. The locked
+Linux environment uses PyTorch 2.13 with CUDA 13 and SGLang 0.5.18. Install a compatible
+NVIDIA driver, the CUDA Toolkit with `nvcc`, and a C++ compiler for SGLang kernel
+compilation.
 
 ```bash
-uv run --env-file .env eagle3-olmo2-hydra full training.max_steps=2 cli.limit=16
+uv run --env-file .env python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
-The command writes the resolved module configs under the configured output
-directory and forwards to the existing SpecForge pipeline. Full training and
-inference still require CUDA, model access, and DVC artifacts when refs exist.
-See [implementation status](docs/implementation-status.md) for validation
-limits and current DVC remote limitations.
+The last value must be `True` for GPU stages. Training keeps the frozen target
+weights in CPU RAM by default and transfers them to the GPU on demand. This reduces
+peak VRAM at the cost of transfers on each batch. With sufficient VRAM, pass
+`model.train_target_cpu_offload=false` to keep the target on the GPU. Use the pilot
+at the intended context length to estimate VRAM and runtime for a full run.
 
-## Run the pipeline
+To record experiments in MLflow, set `MLFLOW_TRACKING_URI` in `.env` to an
+absolute SQLite URI such as `sqlite:////mnt/ml-data/eagle3/outputs/mlflow.db`
+and set `MLFLOW_EXPERIMENT_NAME` to group runs. Training writes directly to
+SQLite.
 
-Run a short data preparation first:
+## 2. Run smoke and pilot training
+
+Run the smoke first. After it completes, run the pilot to check resource use
+at a larger scale. Each command prepares the train split and captures validation
+features before training. To run individual stages instead, see
+[Run training stages separately](#run-training-stages-separately).
 
 ```bash
-uv run --env-file .env eagle3-olmo2 prepare-data --limit 16
-uv run --env-file .env eagle3-olmo2 prepare-features --split all
-uv run --env-file .env eagle3-olmo2 compose
+uv run --env-file .env eagle3-olmo2 --profile smoke full &&
+uv run --env-file .env eagle3-olmo2 --profile pilot full
 ```
 
-The feature step captures train and validation features separately using
-SpecForge's `prepare_hidden_states.py`, with capture batch size 1 and a
-conservative SGLang static-memory fraction capped from detected free VRAM and
-an estimate of target-weight memory. Training uses microbatch 1 and CPU
-optimizer-state offload; available and peak VRAM are recorded per stage. The
-generated run YAML is written under the directory configured by
-`EAGLE3_OUTPUT_DIR`.
-
-GPU-backed commands check CUDA availability before downloading data or models.
-`prepare-data` and the config composer remain usable on a CPU-only host.
-
-Run a full short smoke training and evaluation:
+After pilot training, run validation to inspect offline metrics and compare
+target-only and speculative generation on the development prompts:
 
 ```bash
-uv run --env-file .env eagle3-olmo2 full --limit 16
+uv run --env-file .env eagle3-olmo2 --profile pilot validate
 ```
 
-Run training later from prepared feature files:
+The `full` **command** prepares train and validation data, captures validation
+features, trains with live OLMo-2 activations, registers the best and latest
+checkpoints in DVC, and runs one generation request. The **profile** sets the scale
+and output directory.
+
+| Profile |        Train rows | Validation rows | Effective batch | Optimizer steps                   |
+| ------- | ----------------: | --------------: | --------------: | --------------------------------- |
+| `smoke` |          Up to 16 |         Up to 8 |               4 | 2                                 |
+| `pilot` |         Up to 512 |       Up to 128 |               1 | One epoch, based on eligible rows |
+| `full`  | All eligible rows |     Up to 1,024 |               1 | One epoch, based on eligible rows |
+
+Each profile writes to `$EAGLE3_OUTPUT_DIR/<profile>/`. A completed end-to-end run has
+`training-status.json` with status `complete`, a `checkpoint-manifest.json`, and
+`inference-smoke.json`. Use a separate output directory for each training attempt.
+
+## 3. Run full training
+
+Review the pilot's `training-plan.json`, `training-status.json`, `gpu-memory.json`, and
+`train-input-manifest.json` before approving the full run. The approval directory
+must contain a completed live-capture pilot and its generation smoke result. The
+runner projects validation capture storage for the working files, DVC cache, and
+remote. Training activations are never written to disk.
 
 ```bash
-uv run --env-file .env eagle3-olmo2 train
+uv run --env-file .env eagle3-olmo2 --profile full full \
+  'cli.approved_pilot=${oc.env:EAGLE3_OUTPUT_DIR}/pilot'
 ```
 
-`full` and `train` invoke the native `specforge train --config ...` CLI. Set
-`training.max_steps` low in the training YAML for the first optimizer-step
-smoke. Before training, the runner counts prepared feature files and adjusts
-the evaluation interval to divide the expected final optimizer step, so the
-last step is evaluated even when a short dataset ends before the configured
-period. To resume all optimizer, scheduler, step, and RNG state, set
-`infrastructure.resume_from_checkpoint` in the experiment YAML or edit the
-generated SpecForge config's `training.resume_from`. If resuming from an older
-step than the recorded best checkpoint, the runner clears that future best
-alias before training so the resumed timeline can select its own best by
-acceptance length.
+The full profile keeps the train split and optimizer steps uncapped. It processes up to
+1,024 tokens per sequence, uses AdamW with CPU optimizer offload and a cosine schedule,
+and evaluates and saves every 1,000 steps. SpecForge also saves the final step.
 
-Run the native SGLang EAGLE-3 export and one target-plus-drafter request after a
-successful training run with:
+Pilot and full share the optimizer settings, including a learning rate of
+`1e-4`, 1% warmup, and TTT length 8. The cosine schedule covers the actual
+number of optimizer steps in each profile.
+Treat one full epoch as the first quality baseline. Compare checkpoint curves
+for validation loss and acceptance, then confirm the selected checkpoint with
+generation acceptance and target-only parity. Consider a longer run if
+validation still improves at the end. Set the intended epoch count before
+starting a comparison run so its scheduler uses that horizon.
+
+## 4. Validate the trained checkpoint
 
 ```bash
-uv run --env-file .env eagle3-olmo2 inference
+uv run --env-file .env eagle3-olmo2 --profile full validate
 ```
 
-`full` runs this smoke automatically after training. Its response and SGLang
-`spec_accept_length`, when returned by the pinned server, are saved to
-the `EAGLE3_OUTPUT_DIR` directory configured in `.env`.
+This runs offline evaluation on the validation features, then compares target-only and
+speculative generation on [24 development prompts](configs/prompts/quick.jsonl). It
+selects the best checkpoint by simulated acceptance length, with latest as the fallback.
+Give `cli.checkpoint` the absolute path to a registered step directory to evaluate a
+different checkpoint.
 
-## Tracking and checkpoints
-
-With `MLFLOW_TRACKING_URI` set in the process environment or
-`infrastructure.mlflow_tracking_uri` set in the experiment YAML, the composer
-enables SpecForge's MLflow tracker
-and logs the resolved run config, training/evaluation metrics, optimizer step,
-performance values, and capture/training/evaluation VRAM metrics. The runner
-also saves scalar history and SVG plots locally and attaches them to MLflow
-after training, including the current Git commit SHA as `project.git_commit`.
-Without it, SpecForge logs locally to stdout while the runner saves local
-metric history/plots for metrics emitted by the trainer. When the native logs
-contain those metrics, the plot set includes `train_loss.svg`,
-`validation_loss.svg`, `acceptance_length.svg`, and per-depth acceptance-rate
-plots. Native
-checkpointing uses `save_interval`, `max_checkpoints`, and a final checkpoint;
-SpecForge's checkpoint manager selects best checkpoints by
-`eval/simulated_acc_len` and writes resume state. Checkpoints are under the
-configured `output_dir`.
-
-Run the CPU checks and configured quality hooks with:
+After checkpoint selection, capture and evaluate the held-out test partition:
 
 ```bash
-uv run --env-file .env --locked --extra pipeline --group dev pytest
-uv run --env-file .env pre-commit run --all-files
-uv lock --check
+uv run --env-file .env eagle3-olmo2 --profile full prepare-data cli.split=test
+uv run --env-file .env eagle3-olmo2 --profile full prepare-features cli.split=test
+uv run --env-file .env eagle3-olmo2 --profile full validate cli.split=test
 ```
 
-The native trainer exposes acceptance-rate metrics at speculation depths and
-simulated acceptance length during offline evaluation. The previous README
-recorded `eval/simulated_acc_len` 0.0604 at step 2 and an SGLang response of
-“2 plus 2 equals 4.” with speculative acceptance length 1.1429. These values
-are historical reports and were not reproduced during this audit.
+The final command uses the [separate final prompt suite](configs/prompts/final.jsonl).
+Look in `validate-*/offline-eval.json` for loss and simulated acceptance, and in
+`validate-*/generation.html` for responses and the generation comparison.
 
-## Testing and limitations
-
-CPU-only unit tests are in `tests/`. GPU integration tests are marked separately
-and require the model downloads, CUDA, SpecForge dependencies, and an NVIDIA
-GPU. Run the CPU tests with:
+## 5. Generate text or export a draft
 
 ```bash
-uv run --env-file .env --locked --extra pipeline --group dev pytest
+uv run --env-file .env eagle3-olmo2 --profile full inference \
+  'cli.prompt="Explain why the sky is blue."'
 ```
 
-The end-to-end GPU test in `tests/gpu/` is opt-in because it downloads the model
-and dataset, trains, exports, and starts SGLang. The project previously reported
-a full pipeline smoke at small scale on an RTX 3060. Run the acceptance test on
-suitable CUDA hardware with:
+The default `speculative` mode pulls the selected checkpoint from DVC and exports it to
+`inference-*/draft_sglang/`. Set `cli.mode=target-only` to run with just OLMo-2, or
+`cli.mode=compare` to run both modes sequentially and compare greedy output token IDs
+and latency. Run comparison on a prompt suite with
+`cli.suite=configs/prompts/quick.jsonl` in place of the prompt argument. Each JSONL row
+needs a unique `id`, `category`, `language`, `context_bucket`, `messages` ending in a
+user turn, a positive `max_new_tokens`, and `check_type` (`manual`, `exact`, or `json`).
+The last two checks also need `expected`.
+
+Open `inference-*/generation.html` for the human-readable report. The accompanying JSON
+and JSONL contain token IDs, per-request metrics, and errors. The server uses localhost
+port 30000 by default. Set `evaluation.inference_port` if it is occupied. The pinned
+SGLang response provides acceptance counters in aggregate, and `cli.trace=true` reports
+per-round tracing as unavailable.
+
+To export weights without generating text, use the native SpecForge exporter on a
+restored, registered checkpoint:
+
+```bash
+read -r -p 'Absolute path to the restored checkpoint: ' CHECKPOINT
+uv run --env-file .env specforge export --to sglang \
+  --checkpoint "$CHECKPOINT" \
+  --draft-config configs/models/olmo2_1b_eagle3.json \
+  --vocab-mapping "$CHECKPOINT/eagle3-vocab-mapping.pt" \
+  --output-dir "$(dirname "$CHECKPOINT")/draft_sglang"
+```
+
+The resulting directory contains the draft weights and configuration for SGLang. Pair it
+with the OLMo-2 target and tokenizer revisions recorded in the run's
+`model-snapshot.json`.
+
+## Inspect experiment metrics
+
+Every training run writes `metrics.jsonl`, `metrics-schema.json`, and SVG plots under
+`plots/` when those metrics are available. Compare `train/loss` and `eval/loss` across
+optimizer steps. `eval/simulated_acc_len` estimates offline acceptance. The
+`generation/*` counters record SGLang's observed draft acceptance and latency.
+
+To inspect logged runs in a browser, start the local MLflow server and open
+`http://127.0.0.1:5000`.
+
+```bash
+uv run --env-file .env sh -eu -c 'mlflow server --backend-store-uri "$MLFLOW_TRACKING_URI" --host 127.0.0.1'
+```
+
+## Run training stages separately
+
+Use this route in place of the end-to-end pilot if you need to prepare data
+on a CPU host, inspect the training plan, or start from existing features.
+
+```bash
+uv run --env-file .env eagle3-olmo2 --profile pilot prepare-data cli.split=train
+uv run --env-file .env eagle3-olmo2 --profile pilot prepare-data cli.split=eval
+uv run --env-file .env eagle3-olmo2 --profile pilot prepare-features cli.split=eval
+uv run --env-file .env eagle3-olmo2 --profile pilot preflight
+uv run --env-file .env eagle3-olmo2 --profile pilot train
+```
+
+- `prepare-data` writes JSONL conversations and checksum manifests. Train comes from
+  `train_sft`. Validation (`eval`) and the final `test` partition come from `test_sft`
+  and require the prepared train split for overlap checks.
+- `prepare-features` supports `eval` and `test`. It restores the matching JSONL
+  refs, writes hidden states and a capture manifest, and registers the split in DVC.
+- `preflight` restores the train JSONL and validation features. On CPU, it tokenizes
+  the train split, filters rows without usable assistant tokens, builds the
+  vocabulary map, and writes `training-plan.json` with the expected optimizer steps
+  and the size of the token cache. It needs access to the target snapshot and tokenizer.
+- `train` uses the train JSONL and the validation features. The local preprocessing
+  cache under `EAGLE3_CACHE_DIR/train-inputs` holds only token IDs, loss masks and the
+  vocabulary map. A cache miss rebuilds those inputs. Existing offline train
+  artifacts and their DVC objects are outside this workflow.
+- Use the end-to-end pilot command to produce the generation smoke report required
+  for full-run approval. For staged training with the `full` profile, pass
+  `cli.approved_pilot` to `train`.
+
+## Resume an interrupted run
+
+Use a retained, complete live-capture `*-stepN` checkpoint from before the final
+step. Keep the original train JSONL, tokenizer, target, preprocessing cache,
+and training schedule. Use a fresh `infrastructure.output_dir` and set
+`infrastructure.resume_from_checkpoint` to the original step directory.
+Checkpoints from the earlier offline workflow remain usable for inference when
+registered with their vocabulary map. Optimizer resume requires a live-capture
+checkpoint whose training-input manifest matches the configured run.
+
+## Local DVC recovery
+
+Preparation creates a DVC workspace in each artifact's parent directory. Keep the
+`*.dvc` refs and access to the `local-storage` object store together. The pipeline pulls
+from that store and checks the refs before consuming data, features, or checkpoints.
+
+If the cache or remote path moves, set `DVC_WORKSPACE` to the absolute path of the
+existing artifact parent and apply the new paths from `.env`:
+
+```bash
+uv run --env-file .env eagle3-olmo2-dvc-setup "$DVC_WORKSPACE"
+```
+
+Set `DVC_REF` to the `*.dvc` filename in that workspace. Use `pull` to restore the
+artifact, or `push` to finish an interrupted upload before retrying a pipeline stage.
+
+```bash
+uv run --env-file .env dvc --cd "$DVC_WORKSPACE" pull -r local-storage "$DVC_REF"
+```
+
+If a prepared artifact conflicts with a changed dataset revision, seed, or row limit,
+choose new data and feature paths. The manifests record the original selection and
+checksums.
+
+## Tests and code quality
+
+```bash
+uv run --locked --extra pipeline --group dev pytest --ignore=tests/gpu
+uv run --locked --group dev pre-commit run --all-files
+```
+
+On a CUDA host with model and dataset access, run the opt-in integration test for
+capture, training, resume, export, and inference:
 
 ```bash
 EAGLE3_GPU_TEST=1 uv run --env-file .env --locked --extra pipeline --group dev pytest tests/gpu/test_pipeline_smoke.py -v
 ```
 
-The opt-in GPU smoke passed, including model/tokenizer loading, OLMo chat-template
-masking, train/eval feature capture, two optimizer steps, evaluation, checkpoint
-resume, draft export, SGLang inference, MLflow metrics, and plot artifacts.
-CPU unit tests and the GPU integration test cover separate parts of the project;
-see the implementation status for remaining shared-storage and external-service
-work.
+The project CLI lives in
+[`src/eagle3_olmo2/`](src/eagle3_olmo2/), the trainer and exporter in
+[`specforge/`](specforge/), and the integration tests in [`tests/gpu/`](tests/gpu/).

@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - olmo2_1b
+  - _self_
+
+experiment:
+  name: olmo2-1b-eagle3-smoke
+
+infrastructure:
+  output_dir: ${oc.env:EAGLE3_OUTPUT_DIR,outputs/olmo2_1b_eagle3}/smoke
+  profile: smoke
+
+dataset:
+  train_samples: 16
+  eval_samples: 8
+  test_samples: 8
+  train_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/smoke/train.jsonl
+  eval_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/smoke/validation.jsonl
+  test_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/smoke/test.jsonl
+  eval_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/smoke/features/eval
+  test_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/smoke/features/test
+
+training:
+  max_steps: 2
+  save_interval: 1
+  log_interval: 1
+
+evaluation:
+  eval_interval: 1
+  max_eval_samples: 8

@@ -1,15 +1,16 @@
 model:
   target_model_path: allenai/OLMo-2-0425-1B-Instruct
-  revision: main
+  revision: 48d788eca847d4d7548f375ad03d3c9312f6139e
   tokenizer_path: allenai/OLMo-2-0425-1B-Instruct
-  tokenizer_revision: main
+  tokenizer_revision: 48d788eca847d4d7548f375ad03d3c9312f6139e
   draft_architecture: LlamaForCausalLMEagle3
   draft_model_config: olmo2_1b_eagle3.json
   trust_remote_code: false
   torch_dtype: bfloat16
-  # SGLang owns frozen-target feature capture. This must be verified against
-  # the pinned SpecForge/SGLang runtime before a GPU run is considered valid.
+  # SGLang handles evaluation capture and generation. Training uses the
+  # Transformers OLMo-2 backbone for the frozen forward pass.
   target_backend: sglang
+  train_target_cpu_offload: true
   # SpecForge pins SGLang 0.5.18, which rejects FlashInfer for Olmo2 targets.
   capture_attention_backend: triton
   sglang_mem_fraction_static: 0.35

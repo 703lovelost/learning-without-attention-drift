@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from tempfile import mkdtemp
 
 import click
 from hydra import compose, initialize_config_dir
@@ -16,19 +17,25 @@ _COMMANDS = (
     "prepare-data",
     "prepare-features",
     "compose",
+    "preflight",
+    "register-checkpoint",
+    "validate",
     "train",
     "inference",
     "full",
 )
 
 
-def compose_hydra_config(overrides: tuple[str, ...] | list[str]):
+def compose_hydra_config(
+    overrides: tuple[str, ...] | list[str], profile: str = "baseline"
+):
     """Compose model/data/training/evaluation groups with Hydra overrides."""
     config_dir = ROOT / "configs"
     with initialize_config_dir(
         version_base="1.3", config_dir=str(config_dir.resolve())
     ):
-        return compose(config_name="hydra/olmo2_1b", overrides=list(overrides))
+        name = "olmo2_1b" if profile == "baseline" else f"olmo2_1b_{profile}"
+        return compose(config_name=f"hydra/{name}", overrides=list(overrides))
 
 
 def write_compat_experiment(config, output_dir: Path) -> tuple[Path, Path]:
@@ -54,6 +61,7 @@ def write_compat_experiment(config, output_dir: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
 
+    resolved["infrastructure"]["mlflow_tracking_uri"] = None
     experiment = {
         "experiment": {
             "name": resolved["experiment"]["name"],
@@ -72,35 +80,31 @@ def write_compat_experiment(config, output_dir: Path) -> tuple[Path, Path]:
 
 
 @click.command()
+@click.option(
+    "--profile",
+    type=click.Choice(("baseline", "smoke", "pilot", "full")),
+    default="baseline",
+)
 @click.argument("command", type=click.Choice(_COMMANDS))
 @click.argument("overrides", nargs=-1)
-def main(command: str, overrides: tuple[str, ...]) -> None:
+def main(command: str, overrides: tuple[str, ...], profile: str) -> None:
     """Run a pipeline command with Hydra config overrides.
 
-    Example: eagle3-olmo2-hydra full training.max_steps=2 cli.limit=16
+    Example: eagle3-olmo2 full training.max_steps=2 cli.limit=16
     """
     ensure_configured_storage_dirs()
-    config = compose_hydra_config(overrides)
+    config = compose_hydra_config(overrides, profile)
     resolved = OmegaConf.to_container(config, resolve=True)
     output_dir = resolve_path(resolved["infrastructure"]["output_dir"])
-    hydra_dir = output_dir / "hydra-config"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hydra_dir = Path(mkdtemp(prefix="hydra-", dir=output_dir))
     experiment_path, _ = write_compat_experiment(config, hydra_dir)
 
-    cli_config_path = resolved["cli"].get("output_config")
-    if cli_config_path is None:
-        cli_config_path = output_dir / "run.yaml"
-    else:
-        cli_config_path = resolve_path(Path(cli_config_path))
-
-    forwarded = [
-        "eagle3-olmo2",
-        command,
-        "--experiment",
-        str(experiment_path),
-        "--output-config",
-        str(cli_config_path),
-    ]
+    forwarded = ["eagle3-olmo2", command, "--experiment", str(experiment_path)]
     cli_options = resolved["cli"]
+    if cli_options.get("output_config") is not None:
+        path = resolve_path(cli_options["output_config"])
+        forwarded.extend(("--output-config", str(path)))
     if cli_options.get("limit") is not None:
         forwarded.extend(("--limit", str(cli_options["limit"])))
     if cli_options.get("split"):
@@ -110,7 +114,16 @@ def main(command: str, overrides: tuple[str, ...]) -> None:
             ("--cuda-visible-devices", str(cli_options["cuda_visible_devices"]))
         )
 
+    for name in ("checkpoint", "mode", "suite", "prompt", "approved_pilot"):
+        if cli_options.get(name) is not None:
+            forwarded.extend(("--" + name.replace("_", "-"), str(cli_options[name])))
+    if cli_options.get("trace"):
+        forwarded.append("--trace")
+
+    from eagle3_olmo2.cli import _configure_tracking_environment
     from eagle3_olmo2.cli import main as pipeline_main
+
+    _configure_tracking_environment(resolved["infrastructure"])
 
     previous_argv = sys.argv
     try:

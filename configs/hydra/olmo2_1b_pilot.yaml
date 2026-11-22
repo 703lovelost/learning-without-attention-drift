@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - olmo2_1b_full
+  - _self_
+
+experiment:
+  name: olmo2-1b-eagle3-pilot
+
+infrastructure:
+  output_dir: ${oc.env:EAGLE3_OUTPUT_DIR,outputs/olmo2_1b_eagle3}/pilot
+  profile: pilot
+
+dataset:
+  train_samples: 512
+  eval_samples: 128
+  test_samples: 128
+  train_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/pilot/train.jsonl
+  eval_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/pilot/validation.jsonl
+  test_data_path: ${oc.env:EAGLE3_DATA_DIR,data}/pilot/test.jsonl
+  eval_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/pilot/features/eval
+  test_features_path: ${oc.env:EAGLE3_DATA_DIR,data}/pilot/features/test
+
+training:
+  # Use the full profile's optimizer settings and exhaust the pilot captures.
+  save_interval: 32
+  log_interval: 8
+
+evaluation:
+  eval_interval: 32
+  max_eval_samples: 128
